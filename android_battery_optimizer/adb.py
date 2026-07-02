@@ -1,9 +1,11 @@
-import shutil
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence
+
 from .android import DeviceInfo
+
 
 @dataclass
 class CommandResult:
@@ -72,24 +74,54 @@ class AdbClient:
         output: Callable[[str], None] = print,
     ) -> None:
         self.runner = runner
-        self.serial = serial
+        self._serial = serial
+        self._device_info_cache: Dict[str, DeviceInfo] = {}
         self.dry_run = dry_run
         self.output = output
 
+    @property
+    def serial(self) -> Optional[str]:
+        return self._serial
+
+    @serial.setter
+    def serial(self, value: Optional[str]) -> None:
+        if self._serial != value:
+            self._serial = value
+            self._device_info_cache.clear()
+
     def get_device_info_struct(self) -> DeviceInfo:
         serial = self.serial or "unknown-device"
-        brand = self.shell_text(["getprop", "ro.product.brand"], check=False)
-        model = self.shell_text(["getprop", "ro.product.model"], check=False)
-        release = self.shell_text(["getprop", "ro.build.version.release"], check=False)
-        sdk_str = self.shell_text(["getprop", "ro.build.version.sdk"], check=False)
-        fingerprint = self.shell_text(["getprop", "ro.build.fingerprint"], check=False)
+        if serial in self._device_info_cache:
+            return self._device_info_cache[serial]
+
+        cmd = (
+            "getprop ro.product.brand; "
+            "getprop ro.product.model; "
+            "getprop ro.build.version.release; "
+            "getprop ro.build.version.sdk; "
+            "getprop ro.build.fingerprint"
+        )
+        out = self.shell_text([cmd], check=False)
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        if len(lines) < 5:
+            brand = self.shell_text(["getprop", "ro.product.brand"], check=False)
+            model = self.shell_text(["getprop", "ro.product.model"], check=False)
+            release = self.shell_text(["getprop", "ro.build.version.release"], check=False)
+            sdk_str = self.shell_text(["getprop", "ro.build.version.sdk"], check=False)
+            fingerprint = self.shell_text(["getprop", "ro.build.fingerprint"], check=False)
+        else:
+            brand = lines[0]
+            model = lines[1]
+            release = lines[2]
+            sdk_str = lines[3]
+            fingerprint = lines[4]
 
         try:
             sdk_int = int(sdk_str)
         except (ValueError, TypeError):
             sdk_int = 0
 
-        return DeviceInfo(
+        info = DeviceInfo(
             serial=serial,
             brand=brand,
             model=model,
@@ -97,6 +129,8 @@ class AdbClient:
             sdk_int=sdk_int,
             fingerprint=fingerprint,
         )
+        self._device_info_cache[serial] = info
+        return info
 
     def get_device_metadata(self) -> Dict[str, str]:
         serial = self.serial or "unknown-device"
@@ -142,6 +176,48 @@ class AdbClient:
             return result.returncode == 0
         except Exception:
             return False
+
+    def supports_device_config_write(
+        self, namespace: str, key: str, probe_value: str
+    ) -> bool:
+        # Android 14+ builds restrict shell device_config writes to a
+        # build-time flag allowlist; reads still succeed, so probe by writing.
+        if self.dry_run:
+            return True
+        try:
+            current = self.shell(
+                ["device_config", "get", namespace, key], check=False
+            )
+            value = current.stdout.strip()
+            if current.returncode == 0 and value not in {"", "null"}:
+                result = self.shell(
+                    ["device_config", "put", namespace, key, value],
+                    mutate=True,
+                    check=False,
+                )
+                return self._device_config_write_ok(result)
+
+            put_result = self.shell(
+                ["device_config", "put", namespace, key, probe_value],
+                mutate=True,
+                check=False,
+            )
+            if not self._device_config_write_ok(put_result):
+                return False
+            delete_result = self.shell(
+                ["device_config", "delete", namespace, key],
+                mutate=True,
+                check=False,
+            )
+            return self._device_config_write_ok(delete_result)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _device_config_write_ok(result: CommandResult) -> bool:
+        if result.returncode != 0:
+            return False
+        return "SecurityException" not in (result.stdout + result.stderr)
 
     def supports_appops(self) -> bool:
         try:

@@ -433,13 +433,20 @@ class OptimizerTests(unittest.TestCase):
 
     def test_parse_adb_devices(self):
         devices = parse_adb_devices(
-            "List of devices attached\nserial-1\tdevice\nserial-2\tunauthorized\n"
+            "List of devices attached\n"
+            "serial-1\tdevice\n"
+            "serial-2\tunauthorized\n"
+            "adb-RFCT8025BKP-6rXWfv (2)._adb-tls-connect._tcp\tdevice\n"
+            "* daemon not running; starting now at tcp:5037\n"
+            "emulator-5554 device\n"
         )
         self.assertEqual(
             devices,
             [
                 {"serial": "serial-1", "status": "device"},
                 {"serial": "serial-2", "status": "unauthorized"},
+                {"serial": "adb-RFCT8025BKP-6rXWfv (2)._adb-tls-connect._tcp", "status": "device"},
+                {"serial": "emulator-5554", "status": "device"},
             ],
         )
 
@@ -847,19 +854,15 @@ class OptimizerTests(unittest.TestCase):
             except CommandError:
                 pass
 
-            # Only some_setting (index 0) should be reverted because SUCCESS_0 was in stdout
-            # other_setting (index 1) should NOT be reverted
+            # Both some_setting (index 0) and other_setting (index 1) should be reverted
             mock_run.assert_any_call(
                 ["adb", "-s", "serial-1", "shell", "settings", "put", "global", "some_setting", "old_value"],
                 capture_output=True, text=True, input=None, timeout=30
             )
-
-            # Verify other_setting was NOT reverted
-            for call in mock_run.call_args_list:
-                args = call[0][0]
-                cmd_str = " ".join(args)
-                if "other_setting" in cmd_str and "put" in cmd_str:
-                    self.assertFalse("old_value" in cmd_str)
+            mock_run.assert_any_call(
+                ["adb", "-s", "serial-1", "shell", "settings", "put", "global", "other_setting", "old_value"],
+                capture_output=True, text=True, input=None, timeout=30
+            )
 
     @patch("android_battery_optimizer.adb.subprocess.run")
     def test_no_rollback_if_not_dispatched(self, mock_run):
@@ -1089,7 +1092,7 @@ class OptimizerTests(unittest.TestCase):
             skipped = app.restrict_background_apps(level="ignore")
 
             # Assert com.example.chat appears in returned skipped list
-            self.assertIn("com.example.chat", skipped)
+            self.assertIn("com.example.chat", skipped["skipped_whitelisted"])
 
             # Check all calls for mutations of com.example.chat
             for call in mock_run.call_args_list:
@@ -1157,7 +1160,7 @@ class OptimizerTests(unittest.TestCase):
                     app.recorder.prefetch_package_states()
                     app.recorder.set_appop("com.example.app", "RUN_ANY_IN_BACKGROUND", "ignore")
 
-            self.assertIn("AppOps data was not collected or command failed", str(cm.exception))
+            self.assertIn("Failed to parse appop output", str(cm.exception))
 
             # Verify no mutation
             for call in mock_run.call_args_list:
@@ -1180,7 +1183,7 @@ class OptimizerTests(unittest.TestCase):
                     app.recorder.prefetch_package_states()
                     app.recorder.set_standby_bucket("com.missing.pkg", "rare")
 
-            self.assertIn("Could not determine standby bucket for package: com.missing.pkg", str(cm.exception))
+            self.assertIn("Failed to read standby bucket for package com.missing.pkg", str(cm.exception))
 
             # Verify no mutation
             for call in mock_run.call_args_list:

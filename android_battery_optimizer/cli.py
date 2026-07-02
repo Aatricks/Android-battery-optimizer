@@ -3,9 +3,10 @@ import os
 import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
-from .adb import AdbClient, SubprocessRunner, CommandError
-from .app import BatteryOptimizerApp
+
+from .adb import AdbClient, CommandError, SubprocessRunner
 from .android import parse_adb_devices, resolve_package_choice
+from .app import BatteryOptimizerApp
 from .recorder import SnapshotError, VerificationError
 
 APP_NAME = "android-battery-optimizer"
@@ -51,7 +52,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     parser_diagnose = add_subparser("diagnose", help="Run battery diagnostics")
     parser_diagnose.add_argument("--output", help="Save report to specified JSON file")
-    
+
     # We want --third-party-only to be the default, but let user toggle it with --all-packages
     # We'll use a dest variable that defaults to True for third_party_only.
     # The requirement is: --third-party-only / --all-packages, default third-party only
@@ -69,12 +70,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser_wl = add_subparser("whitelist", help="Manage whitelist")
     wl_sub = parser_wl.add_subparsers(dest="wl_command")
     wl_sub.add_parser("list", help="List whitelisted apps", parents=[parent_parser])
-    
+
     parser_wl_add = wl_sub.add_parser("add", help="Add app to whitelist", parents=[parent_parser])
     parser_wl_add.add_argument("package", help="Package name")
-    
+
     parser_wl_remove = wl_sub.add_parser("remove", help="Remove app from whitelist", parents=[parent_parser])
     parser_wl_remove.add_argument("package", help="Package name")
+
+    add_subparser(
+        "doctor-state",
+        help="Check saved state for non-restorable standby bucket entries"
+    )
 
     return parser.parse_args(argv)
 
@@ -275,9 +281,11 @@ class BatteryOptimizerCLI:
                     self.output("Error: --yes is required for restricting apps unless --dry-run is used.")
                     return 1
                 self.output(f"Setting RUN_ANY_IN_BACKGROUND={args.level} for third-party apps...")
-                skipped = self.app.restrict_background_apps(level=args.level)
-                for pkg in skipped:
+                res = self.app.restrict_background_apps(level=args.level)
+                for pkg in res["skipped_whitelisted"]:
                     self.output(f"  Skipping whitelisted app: {pkg}")
+                for pkg in res["skipped_non_restorable"]:
+                    self.output(f"  Skipping app with non-restorable standby bucket: {pkg}")
                 self.output("Background restrictions updated.")
                 return 0
 
@@ -285,16 +293,24 @@ class BatteryOptimizerCLI:
                 import json
                 self.output("Running diagnostics. This may take a moment...")
                 report = self.app.diagnose(third_party_only=args.third_party_only)
-                
+
                 if report["warnings"]:
                     self.output("\nWarnings:")
                     for w in report["warnings"]:
                         self.output(f"  {w}")
-                        
+
                 self.output("\nDiagnosis Summary:")
                 for pkg in report["packages"]:
-                    self.output(f"  {pkg['package']}: {pkg['recommendation']} ({pkg['reason']})")
-                    
+                    self.output(
+                        f"  {pkg['package']}: {pkg['recommendation']} "
+                        f"({pkg['reason']})"
+                    )
+
+                if report.get("doze_whitelist_user"):
+                    self.output("\nApps bypassing Doze (user whitelisted):")
+                    for pkg in report["doze_whitelist_user"]:
+                        self.output(f"  {pkg} (bypasses Doze)")
+
                 if args.output:
                     with open(args.output, "w") as f:
                         json.dump(report, f, indent=2)
@@ -305,43 +321,50 @@ class BatteryOptimizerCLI:
                 if not args.yes and not args.dry_run:
                     self.output("Error: --yes is required for smart-restrict unless --dry-run is used.")
                     return 1
-                    
+
                 mode = "aggressive" if args.aggressive else "balanced"
                 self.output(f"Running smart-restrict in {mode} mode...")
-                
+
                 result = self.app.smart_restrict(
-                    aggressive=args.aggressive, 
+                    aggressive=args.aggressive,
                     min_last_used_days=args.min_last_used_days
                 )
-                
+
                 if result.get("warnings"):
                     self.output("\nWarnings:")
                     for w in result["warnings"]:
                         self.output(f"  {w}")
-                
+
                 applied = result.get("applied", [])
                 skipped = result.get("skipped", [])
                 kept = result.get("kept", [])
-                
+
                 self.output("\nSmart restrict summary:")
                 self.output(f"  Restricted: {len(applied)}")
                 self.output(f"  Skipped: {len(skipped)}")
                 self.output(f"  Kept: {len(kept)}")
-                
+
                 if applied:
                     if args.dry_run:
                         self.output("\nWould restrict (dry-run):")
                     else:
                         self.output("\nRestricted:")
                     for item in applied:
-                        self.output(f"  {item['package']} -> RUN_ANY_IN_BACKGROUND={item['appop']}, bucket={item['bucket']}")
+                        msg = (
+                            f"  {item['package']} -> "
+                            f"RUN_ANY_IN_BACKGROUND={item['appop']}, "
+                            f"bucket={item['bucket']}"
+                        )
+                        if "wake_lock" in item:
+                            msg += f", WAKE_LOCK={item['wake_lock']}"
+                        self.output(msg)
                         self.output(f"    Reason: {item['reason']}")
-                        
+
                 if skipped:
                     self.output("\nSkipped:")
                     for item in skipped:
                         self.output(f"  {item['package']} -> {item['reason']}")
-                        
+
                 if not args.dry_run:
                     self.output("\nSmart restrict applied successfully.")
                 return 0
@@ -381,6 +404,11 @@ class BatteryOptimizerCLI:
                     for pkg in whitelist:
                         self.output(pkg)
                 elif args.wl_command == "add":
+                    try:
+                        self.app.validate_package(args.package)
+                    except ValueError as exc:
+                        self.output(f"Error: {exc}")
+                        return 1
                     if args.package not in whitelist:
                         whitelist.append(args.package)
                         whitelist.sort()
@@ -450,9 +478,11 @@ class BatteryOptimizerCLI:
                         self.output("Skipped third-party app restrictions.")
                         continue
                     self.output("Setting RUN_ANY_IN_BACKGROUND=ignore for third-party apps...")
-                    skipped = self.app.restrict_background_apps(level="ignore")
-                    for pkg in skipped:
+                    res = self.app.restrict_background_apps(level="ignore")
+                    for pkg in res["skipped_whitelisted"]:
                         self.output(f"  Skipping whitelisted app: {pkg}")
+                    for pkg in res["skipped_non_restorable"]:
+                        self.output(f"  Skipping app with non-restorable standby bucket: {pkg}")
                     self.output("Background restrictions updated.")
                 elif choice == "6":
                     self.manage_whitelist()

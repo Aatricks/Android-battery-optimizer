@@ -1,9 +1,10 @@
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
+
 from .adb import AdbClient, CommandError
+from .recorder import StateRecorder
 from .state import StateStore
-from .recorder import PACKAGE_USER_ID, StateRecorder
 
 WHITELIST_FILE = "whitelist.txt"
 
@@ -99,44 +100,92 @@ class BatteryOptimizerApp:
     def apply_documented_safe_optimizations(self) -> None:
         if not self.client.supports_device_config():
             raise ValueError("Device does not support `device_config` command. Optimization aborted.")
+        if not self.client.supports_device_config_write(
+            "activity_manager", "bg_auto_restrict_abusive_apps", "1"
+        ):
+            raise ValueError(
+                "This Android build blocks shell device_config writes "
+                "(Android 14+ flag allowlist). Safe optimizations are "
+                "unavailable on this device."
+            )
 
         with self.recorder.transaction():
-            self.recorder.put_device_config("activity_manager", "bg_auto_restrict_abusive_apps", 1)
-            self.recorder.put_device_config(
-                "activity_manager",
-                "bg_current_drain_auto_restrict_abusive_apps_enabled",
-                1,
-            )
+            self._apply_safe_flags()
+
+    def _apply_safe_flags(self) -> None:
+        self.recorder.put_device_config("activity_manager", "bg_auto_restrict_abusive_apps", 1)
+        self.recorder.put_device_config(
+            "activity_manager",
+            "bg_current_drain_auto_restrict_abusive_apps_enabled",
+            1,
+        )
 
     def apply_experimental_optimizations(self) -> None:
         info = self.client.get_device_info_struct()
-        # SDK 26 (Android 8.0) is a conservative minimum for device_config and stable settings behavior
+        # SDK 26 (Android 8.0) is a conservative minimum for device_config
+        # and stable settings behavior
         if info.sdk_int < 26:
-             raise ValueError(f"Device SDK {info.sdk_int} is too old for experimental optimizations (min SDK 26 required).")
+            raise ValueError(
+                f"Device SDK {info.sdk_int} is too old for experimental "
+                "optimizations (min SDK 26 required)."
+            )
 
         if not self.client.supports_device_config():
-            raise ValueError("Device does not support `device_config` command. Experimental optimization aborted.")
+            raise ValueError(
+                "Device does not support `device_config` command. "
+                "Experimental optimization aborted."
+            )
 
         for namespace in ("global", "system", "secure"):
             if not self.client.supports_settings_namespace(namespace):
-                raise ValueError(f"Device does not support `settings` namespace `{namespace}`. Experimental optimization aborted.")
+                raise ValueError(
+                    f"Device does not support `settings` namespace "
+                    f"`{namespace}`. Experimental optimization aborted."
+                )
+
+        device_config_writable = self.client.supports_device_config_write(
+            "device_idle", "inactive_to", "300000"
+        )
+        if not device_config_writable:
+            self.client.output(
+                "Warning: device_config writes are blocked on this build; "
+                "applying Doze tuning via the legacy device_idle_constants "
+                "setting and skipping abusive-app flags."
+            )
 
         with self.recorder.transaction():
             doze_settings = {
-                "light_after_inactive_to": "0",
-                "light_pre_idle_to": "15000",
-                "light_idle_to": "10000",
+                # light doze: slightly faster than stock, no rapid cycling
+                "light_after_inactive_to": "60000",  # 1 min
+                "light_idle_to": "300000",  # 5 min
                 "light_idle_factor": "2",
-                "light_max_idle_to": "30000",
-                "inactive_to": "15000",
+                "light_max_idle_to": "1800000",  # 30 min
+                # deep doze: enter fast, stay long
+                "inactive_to": "300000",  # 5 min (stock 30 min)
+                "idle_after_inactive_to": "0",
                 "sensing_to": "0",
                 "locating_to": "0",
                 "motion_inactive_to": "0",
-                "idle_after_inactive_to": "0",
-                "quick_doze_delay_to": "5000",
+                "idle_pending_to": "60000",  # 1 min maintenance
+                "max_idle_pending_to": "120000",
+                "idle_pending_factor": "2",
+                "idle_to": "3600000",  # 1 h first deep idle
+                "idle_factor": "2",
+                "max_idle_to": "21600000",  # 6 h max
             }
-            for key, value in doze_settings.items():
-                self.recorder.put_device_config("device_idle", key, value)
+            if device_config_writable:
+                for key, value in doze_settings.items():
+                    self.recorder.put_device_config("device_idle", key, value)
+            else:
+                # Android 14+ allowlist blocks shell device_config writes, but
+                # DeviceIdleController still honors the pre-Android-10 global
+                # setting (verified live on Samsung SM-S901B / Android 16).
+                legacy_constants = ",".join(
+                    f"{key}={value}" for key, value in doze_settings.items()
+                )
+                self.recorder.put_setting(
+                    "global", "device_idle_constants", legacy_constants
+                )
 
             settings_to_apply = [
                 ("global", "window_animation_scale", "0.5"),
@@ -148,7 +197,10 @@ class BatteryOptimizerApp:
                 ("global", "mobile_data_always_on", "0"),
                 ("global", "cached_apps_freezer", "enabled"),
                 ("global", "adaptive_battery_management_enabled", "1"),
-                ("global", "low_power", "1"),
+                ("global", "wifi_scan_always_enabled", "0"),
+                ("secure", "doze_always_on", "0"),
+                ("secure", "ui_night_mode", "2"),
+                ("system", "screen_off_timeout", "30000"),
             ]
             for namespace, key, value in settings_to_apply:
                 self.recorder.put_setting(namespace, key, value)
@@ -163,10 +215,10 @@ class BatteryOptimizerApp:
                 "soundtrigger_disabled=true,"
                 "fullbackup_deferred=true,"
                 "keyvaluebackup_deferred=true,"
-                "firewall_disabled=true,"
-                "gps_mode=0,"
+                "firewall_disabled=false,"
+                "gps_mode=2,"
                 "adjust_brightness_disabled=false,"
-                "adjust_brightness_factor=2,"
+                "adjust_brightness_factor=0.5,"
                 "force_all_apps_standby=true,"
                 "force_background_check=true,"
                 "optional_sensors_disabled=true,"
@@ -174,7 +226,36 @@ class BatteryOptimizerApp:
                 "quick_doze_enabled=true"
             )
             self.recorder.put_setting("global", "battery_saver_constants", constants)
-            self.apply_documented_safe_optimizations()
+            if device_config_writable:
+                self._apply_safe_flags()
+
+            # Data Saver exemptions + toggle (exemptions first)
+            try:
+                # Probe netpolicy support
+                res = self.client.shell(
+                    ["cmd", "netpolicy", "get", "restrict-background"]
+                )
+                from .verification import parse_netpolicy_toggle
+                parse_netpolicy_toggle(res.stdout)
+                netpolicy_supported = True
+            except Exception as exc:
+                self.client.output(
+                    f"Warning: Data Saver optimizations skipped because "
+                    f"restrict-background status query failed: {exc}"
+                )
+                netpolicy_supported = False
+
+            if netpolicy_supported:
+                whitelist = self.load_whitelist()
+                for pkg in whitelist:
+                    try:
+                        self.recorder.add_netpolicy_whitelist(pkg)
+                    except Exception as exc:
+                        self.client.output(
+                            f"Warning: Could not add whitelisted package "
+                            f"{pkg} to restrict-background whitelist: {exc}"
+                        )
+                self.recorder.set_netpolicy_restrict_background(True)
 
     def apply_samsung_experimental_optimizations(self) -> None:
         info = self.client.get_device_info_struct()
@@ -183,10 +264,12 @@ class BatteryOptimizerApp:
 
         for namespace in ("system", "global", "secure"):
             if not self.client.supports_settings_namespace(namespace):
-                raise ValueError(f"Device does not support `settings` namespace `{namespace}`. Samsung optimization aborted.")
+                raise ValueError(
+                    f"Device does not support `settings` namespace "
+                    f"`{namespace}`. Samsung optimization aborted."
+                )
 
         with self.recorder.transaction():
-            self.recorder.prefetch_package_states()
             samsung_settings = {
                 "system": {
                     "master_motion": "0",
@@ -197,6 +280,7 @@ class BatteryOptimizerApp:
                     "intelligent_sleep_mode": "0",
                     "nearby_scanning_enabled": "0",
                     "nearby_scanning_permission_allowed": "0",
+                    "aod_mode": "0",
                 },
                 "global": {
                     "ram_expand_size": "0",
@@ -213,37 +297,39 @@ class BatteryOptimizerApp:
                 for key, value in values.items():
                     self.recorder.put_setting(namespace, key, value)
 
-            installed = self.get_installed_packages_set(user_id=PACKAGE_USER_ID)
-            for package in (
-                "com.samsung.android.game.gos",
-                "com.samsung.android.game.gamelab",
-            ):
-                if package in installed:
-                    self.recorder.set_package_enabled(package, enabled=False)
-
-    def restrict_background_apps(self, level: str = "ignore") -> List[str]:
+    def restrict_background_apps(self, level: str = "ignore") -> Dict[str, List[str]]:
         if not self.client.supports_appops():
             raise ValueError("Device does not support `appops` command via `cmd`. Background restriction aborted.")
         if not self.client.supports_standby_bucket():
             raise ValueError("Device does not support `am set-standby-bucket`. Background restriction aborted.")
 
+        from .operations import normalize_restorable_bucket
+        from .snapshot import SnapshotError
+
         whitelist = set(self.load_whitelist())
         packages = self.get_packages(third_party=True)
-        installed = self.get_installed_packages_set()
-        skipped = []
+        skipped_whitelisted = []
+        skipped_non_restorable = []
 
         with self.recorder.transaction():
             self.recorder.prefetch_package_states()
             for package in packages:
-                if package not in installed:
-                    continue
                 if package in whitelist:
-                    skipped.append(package)
+                    skipped_whitelisted.append(package)
+                    continue
+                try:
+                    prior_bucket = self.recorder._get_standby_bucket(package)
+                    normalize_restorable_bucket(prior_bucket)
+                except (SnapshotError, ValueError):
+                    skipped_non_restorable.append(package)
                     continue
                 self.recorder.set_appop(package, "RUN_ANY_IN_BACKGROUND", level)
-                bucket = "rare" if level == "ignore" else "active"
+                bucket = "active" if level == "allow" else "rare"
                 self.recorder.set_standby_bucket(package, bucket)
-        return skipped
+        return {
+            "skipped_whitelisted": skipped_whitelisted,
+            "skipped_non_restorable": skipped_non_restorable
+        }
 
     def run_bg_dexopt(self) -> None:
         self.client.shell(
@@ -268,7 +354,7 @@ class BatteryOptimizerApp:
         for pkg in installed:
             if pkg.startswith(("com.android.", "com.google.android.", "android")):
                 critical.add(pkg)
-                
+
         commands = {
             "launcher": ["cmd", "package", "resolve-activity", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.HOME"],
             "dialer": ["telecom", "get-default-dialer"],
@@ -278,7 +364,7 @@ class BatteryOptimizerApp:
             "vpn": ["settings", "get", "secure", "always_on_vpn_app"],
             "companion": ["cmd", "companiondevice", "list"],
         }
-        
+
         for name, cmd in commands.items():
             try:
                 out = self.client.shell_text(cmd, check=False)
@@ -301,113 +387,183 @@ class BatteryOptimizerApp:
                         critical.add(out.strip())
             except Exception:
                 pass
-        
+
         return critical
 
-    def smart_restrict(self, aggressive: bool = False, min_last_used_days: Optional[int] = None) -> Dict[str, Any]:
+    def smart_restrict(
+        self,
+        aggressive: bool = False,
+        min_last_used_days: Optional[int] = None,
+    ) -> Dict[str, Any]:
         if not self.client.supports_appops():
-            raise ValueError("Device does not support `appops` command via `cmd`.")
+            raise ValueError(
+                "Device does not support `appops` command via `cmd`."
+            )
         if not self.client.supports_standby_bucket():
             raise ValueError("Device does not support `am set-standby-bucket`.")
 
         whitelist = set(self.load_whitelist())
         critical = self._get_critical_packages()
-        
+
         applied = []
         skipped = []
         kept = []
-        
+
         report = self.diagnose(third_party_only=True)
         warnings = report.get("warnings", [])
-        
+
         if any("Failed to list packages" in w for w in warnings):
             raise ValueError("Diagnose could not list packages.")
-            
+
         if not report["packages"]:
             installed = self.get_packages(third_party=True)
             if installed:
-                raise ValueError("Diagnostic report yielded no packages but third-party packages exist.")
-                
+                raise ValueError(
+                    "Diagnostic report yielded no packages but third-party "
+                    "packages exist."
+                )
+
         import time
+
         from .operations import normalize_restorable_bucket
-        from .recorder import PartialBatchError, SnapshotError
+        from .snapshot import SnapshotError
+
         current_time_ms = time.time() * 1000
-        
-        try:
-            with self.recorder.transaction():
-                self.recorder.prefetch_package_states()
-                for pkg_info in report["packages"]:
-                    pkg = pkg_info["package"]
-                    if pkg in whitelist:
-                        skipped.append({"package": pkg, "reason": "whitelisted"})
-                        continue
-                    if pkg in critical:
-                        skipped.append({"package": pkg, "reason": "critical"})
-                        continue
-                        
-                    if min_last_used_days is not None:
-                        last_used = pkg_info.get("signals", {}).get("last_used", {})
-                        if last_used.get("parsed"):
-                            last_used_ms = float(last_used["epoch_ms"])
-                            if (current_time_ms - last_used_ms) < (min_last_used_days * 86400 * 1000):
-                                skipped.append({"package": pkg, "reason": "recently_used"})
-                                continue
-                        else:
-                            skipped.append({"package": pkg, "reason": "last_used_unknown"})
+        info = self.client.get_device_info_struct()
+
+        user_whitelist = set()
+        if aggressive:
+            try:
+                res = self.client.shell(["cmd", "deviceidle", "whitelist"])
+                from .verification import parse_deviceidle_whitelist
+                user_whitelist = parse_deviceidle_whitelist(res.stdout)
+            except Exception:
+                pass
+
+        with self.recorder.transaction():
+            self.recorder.prefetch_package_states()
+            for pkg_info in report["packages"]:
+                pkg = pkg_info["package"]
+                if pkg in whitelist:
+                    skipped.append({"package": pkg, "reason": "whitelisted"})
+                    continue
+                if pkg in critical:
+                    skipped.append({"package": pkg, "reason": "critical"})
+                    continue
+
+                if min_last_used_days is not None:
+                    last_used = (
+                        pkg_info.get("signals", {})
+                        .get("last_used", {})
+                    )
+                    if last_used.get("parsed"):
+                        last_used_ms = float(last_used["epoch_ms"])
+                        time_diff = current_time_ms - last_used_ms
+                        if time_diff < (min_last_used_days * 86400 * 1000):
+                            skipped.append(
+                                {"package": pkg, "reason": "recently_used"}
+                            )
                             continue
-                    
-                    rec = pkg_info["recommendation"]
-                    reason = pkg_info.get("reason", "")
-                    
-                    if rec == "keep":
-                        kept.append({"package": pkg, "reason": reason})
-                        continue
-                    
-                    try:
-                        prior_bucket = self.recorder._get_standby_bucket(pkg)
-                        normalize_restorable_bucket(prior_bucket)
-                    except (SnapshotError, ValueError):
-                        skipped.append({"package": pkg, "reason": "non_restorable_standby_bucket"})
+                    else:
+                        skipped.append(
+                            {"package": pkg, "reason": "last_used_unknown"}
+                        )
                         continue
 
-                    if aggressive and rec == "aggressive_restrict":
-                        self.recorder.set_appop(pkg, "RUN_ANY_IN_BACKGROUND", "ignore")
-                        self.recorder.set_standby_bucket(pkg, "restricted")
-                        applied.append({
+                rec = pkg_info["recommendation"]
+                reason = pkg_info.get("reason", "")
+
+                if rec == "keep":
+                    kept.append({"package": pkg, "reason": reason})
+                    continue
+
+                try:
+                    prior_bucket = self.recorder._get_standby_bucket(pkg)
+                except SnapshotError:
+                    skipped.append(
+                        {"package": pkg, "reason": "standby_bucket_unreadable"}
+                    )
+                    continue
+
+                try:
+                    normalize_restorable_bucket(prior_bucket)
+                except ValueError:
+                    skipped.append(
+                        {
+                            "package": pkg,
+                            "reason": "non_restorable_standby_bucket",
+                        }
+                    )
+                    continue
+
+                if aggressive and rec == "aggressive_restrict":
+                    self.recorder.set_appop(
+                        pkg, "RUN_ANY_IN_BACKGROUND", "ignore"
+                    )
+                    self.recorder.set_appop(pkg, "WAKE_LOCK", "ignore")
+                    self.recorder.set_standby_bucket(pkg, "restricted")
+                    if pkg in user_whitelist:
+                        self.recorder.remove_deviceidle_whitelist(pkg)
+
+                    if min_last_used_days is not None and info.sdk_int >= 31:
+                        try:
+                            self.recorder.set_app_hibernation(pkg, True)
+                        except Exception:
+                            skipped.append(
+                                {
+                                    "package": pkg,
+                                    "reason": "hibernation_state_unreadable",
+                                }
+                            )
+
+                    applied.append(
+                        {
                             "package": pkg,
                             "appop": "ignore",
+                            "wake_lock": "ignore",
                             "bucket": "restricted",
-                            "reason": reason
-                        })
-                    elif not aggressive and rec in ("restrict", "aggressive_restrict"):
-                        self.recorder.set_appop(pkg, "RUN_ANY_IN_BACKGROUND", "ignore")
-                        self.recorder.set_standby_bucket(pkg, "rare")
-                        applied.append({
+                            "reason": reason,
+                        }
+                    )
+                elif not aggressive and rec in (
+                    "restrict",
+                    "aggressive_restrict",
+                ):
+                    self.recorder.set_appop(
+                        pkg, "RUN_ANY_IN_BACKGROUND", "ignore"
+                    )
+                    self.recorder.set_standby_bucket(pkg, "rare")
+
+                    if min_last_used_days is not None and info.sdk_int >= 31:
+                        try:
+                            self.recorder.set_app_hibernation(pkg, True)
+                        except Exception:
+                            skipped.append(
+                                {
+                                    "package": pkg,
+                                    "reason": "hibernation_state_unreadable",
+                                }
+                            )
+
+                    applied.append(
+                        {
                             "package": pkg,
                             "appop": "ignore",
                             "bucket": "rare",
-                            "reason": reason
-                        })
-                    else:
-                        skipped.append({"package": pkg, "reason": "unsupported_recommendation"})
-        except PartialBatchError as exc:
-            failed = exc.failed_packages
-            new_applied = []
-            for item in applied:
-                if item["package"] in failed:
-                    skipped.append({"package": item["package"], "reason": "standby_bucket_not_controllable"})
+                            "reason": reason,
+                        }
+                    )
                 else:
-                    new_applied.append(item)
-            applied = new_applied
-                    
+                    skipped.append(
+                        {
+                            "package": pkg,
+                            "reason": "unsupported_recommendation",
+                        }
+                    )
+
         return {
             "applied": applied,
             "skipped": skipped,
             "kept": kept,
             "warnings": warnings
         }
-
-    def revert_saved_state(self) -> List[str]:
-        if not self.store.has_entries():
-            return []
-        return self.recorder.restore()

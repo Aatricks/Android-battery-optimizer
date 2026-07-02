@@ -101,7 +101,14 @@ class StateStoreLoadHardeningTests(unittest.TestCase):
 
         store = self._make_store()
 
-        self.assertEqual(store.data, payload)
+        expected = dict(payload)
+        expected.update({
+            "netpolicy": {},
+            "netpolicy_whitelist": {},
+            "deviceidle_whitelist": {},
+            "hibernation": {},
+        })
+        self.assertEqual(store.data, expected)
         self.assertTrue(state_path.exists())
         self.assertFalse(self._corrupt_files())
 

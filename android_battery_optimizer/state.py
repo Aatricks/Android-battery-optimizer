@@ -4,7 +4,8 @@ import os
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Dict, Optional, cast
+
 from .adb import AdbClient, CommandError
 
 SNAPSHOT_FILE = "state.json"
@@ -31,6 +32,10 @@ class StateStore:
             "settings": {},
             "device_config": {},
             "packages": {},
+            "netpolicy": {},
+            "netpolicy_whitelist": {},
+            "deviceidle_whitelist": {},
+            "hibernation": {},
         }
 
     def rebind(self) -> None:
@@ -125,6 +130,61 @@ class StateStore:
                     f"State packages entry '{package}' enabled must be boolean or null."
                 )
 
+    def _validate_netpolicy_section(self, netpolicy: dict[str, object]) -> None:
+        for k, v in netpolicy.items():
+            if not isinstance(k, str):
+                raise ValueError("State netpolicy keys must be strings.")
+            if not isinstance(v, bool):
+                raise ValueError(
+                    f"State netpolicy entry '{k}' must be boolean."
+                )
+
+    def _validate_netpolicy_whitelist_section(
+        self, netpolicy_whitelist: dict[str, object]
+    ) -> None:
+        for uid, item in netpolicy_whitelist.items():
+            if not isinstance(uid, str):
+                raise ValueError(
+                    "State netpolicy_whitelist keys must be strings."
+                )
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"State netpolicy_whitelist entry '{uid}' must be an object."
+                )
+            for required_key in ("package", "prior_member"):
+                if required_key not in item:
+                    raise ValueError(
+                        f"State netpolicy_whitelist entry '{uid}' is "
+                        f"missing '{required_key}'."
+                    )
+            pkg = item["package"]
+            pm = item["prior_member"]
+            if not isinstance(pkg, str) or not isinstance(pm, bool):
+                raise ValueError(
+                    f"State netpolicy_whitelist entry '{uid}' package must "
+                    "be a string and prior_member a boolean."
+                )
+
+    def _validate_deviceidle_whitelist_section(
+        self, deviceidle_whitelist: dict[str, object]
+    ) -> None:
+        for k, v in deviceidle_whitelist.items():
+            if not isinstance(k, str):
+                raise ValueError("State deviceidle_whitelist keys must be strings.")
+            if not isinstance(v, bool):
+                raise ValueError(
+                    f"State deviceidle_whitelist entry '{k}' must be boolean."
+                )
+
+    def _validate_hibernation_section(self, hibernation: dict[str, object]) -> None:
+        for k, v in hibernation.items():
+            if not isinstance(k, str):
+                raise ValueError("State hibernation keys must be strings.")
+            if not isinstance(v, bool):
+                raise ValueError(
+                    f"State hibernation entry '{k}' must be boolean."
+                )
+
     def _normalize_state(self, raw: object) -> dict[str, object]:
         if not isinstance(raw, dict):
             raise ValueError("State root must be an object.")
@@ -138,10 +198,30 @@ class StateStore:
         settings = self._require_dict_section(raw, "settings")
         device_config = self._require_dict_section(raw, "device_config")
         packages = self._require_dict_section(raw, "packages")
+        netpolicy = raw.get("netpolicy", {})
+        if not isinstance(netpolicy, dict):
+            raise ValueError("State field 'netpolicy' must be an object.")
+        netpolicy_whitelist = raw.get("netpolicy_whitelist", {})
+        if not isinstance(netpolicy_whitelist, dict):
+            raise ValueError(
+                "State field 'netpolicy_whitelist' must be an object."
+            )
+        deviceidle_whitelist = raw.get("deviceidle_whitelist", {})
+        if not isinstance(deviceidle_whitelist, dict):
+            raise ValueError(
+                "State field 'deviceidle_whitelist' must be an object."
+            )
+        hibernation = raw.get("hibernation", {})
+        if not isinstance(hibernation, dict):
+            raise ValueError("State field 'hibernation' must be an object.")
 
         self._validate_scalar_kv_section("settings", settings)
         self._validate_scalar_kv_section("device_config", device_config)
         self._validate_packages_section(packages)
+        self._validate_netpolicy_section(netpolicy)
+        self._validate_netpolicy_whitelist_section(netpolicy_whitelist)
+        self._validate_deviceidle_whitelist_section(deviceidle_whitelist)
+        self._validate_hibernation_section(hibernation)
 
         return {
             "version": version,
@@ -149,6 +229,10 @@ class StateStore:
             "settings": dict(settings),
             "device_config": dict(device_config),
             "packages": dict(packages),
+            "netpolicy": dict(netpolicy),
+            "netpolicy_whitelist": dict(netpolicy_whitelist),
+            "deviceidle_whitelist": dict(deviceidle_whitelist),
+            "hibernation": dict(hibernation),
         }
 
     def _load(self) -> Dict[str, object]:
@@ -229,7 +313,18 @@ class StateStore:
             self.path.unlink()
 
     def has_entries(self) -> bool:
-        return any(self.data.get(key) for key in ("settings", "device_config", "packages"))
+        return any(
+            self.data.get(key)
+            for key in (
+                "settings",
+                "device_config",
+                "packages",
+                "netpolicy",
+                "netpolicy_whitelist",
+                "deviceidle_whitelist",
+                "hibernation",
+            )
+        )
 
     def save_or_clear(self) -> None:
         if self.client.dry_run:
