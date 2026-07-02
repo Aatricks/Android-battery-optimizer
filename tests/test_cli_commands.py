@@ -22,6 +22,10 @@ class TestCLICommands(unittest.TestCase):
         self.assertTrue(args.third_party_only)
         self.assertIsNone(args.output)
 
+    def test_parse_doctor_state_subcommand(self):
+        args = parse_args(["doctor-state"])
+        self.assertEqual(args.command, "doctor-state")
+
     def test_parse_diagnose_output(self):
         args = parse_args(["diagnose", "--output", "report.json"])
         self.assertEqual(args.command, "diagnose")

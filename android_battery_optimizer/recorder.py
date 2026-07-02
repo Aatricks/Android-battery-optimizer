@@ -1,35 +1,37 @@
 import re
 from contextlib import contextmanager
-from typing import Callable, Dict, List, Optional, Sequence, cast, Set
+from typing import Dict, List, Optional, Sequence, cast
 
 from .adb import AdbClient, CommandError
-from .state import StateStore
-from .operations import STANDBY_BUCKET_MAP, normalize_restorable_bucket
-
 from .ledger import AnyLedgerEntry
+from .operations import normalize_restorable_bucket
+from .rollback import perform_rollback, restore_appop_value, restore_state
 from .snapshot import (
     SnapshotError,
-    read_settings_namespace,
+    prefetch_package_states,
     read_device_config_namespace,
-    prefetch_package_states
+    read_settings_namespace,
 )
+from .state import StateStore
 from .verification import (
     VerificationError,
     normalize_value,
-    verify_setting,
-    verify_device_config,
+    parse_deviceidle_whitelist,
+    parse_hibernation_state,
+    parse_netpolicy_toggle,
+    parse_netpolicy_whitelist,
+    verify_app_hibernation,
     verify_appop,
+    verify_device_config,
+    verify_deviceidle_whitelist,
+    verify_netpolicy_restrict_background,
+    verify_netpolicy_whitelist,
+    verify_package_enabled,
+    verify_setting,
     verify_standby_bucket,
-    verify_package_enabled
 )
-from .rollback import perform_rollback, restore_appop_value, restore_state
 
 PACKAGE_USER_ID = "0"
-
-class PartialBatchError(RuntimeError):
-    def __init__(self, failed_packages: Set[str]) -> None:
-        self.failed_packages = failed_packages
-        super().__init__(f"Batch transaction had partial package failures: {failed_packages}")
 
 class StateRecorder:
     def __init__(self, client: AdbClient, store: StateStore) -> None:
@@ -67,7 +69,6 @@ class StateRecorder:
         self._package_enabled_cache.clear()
         self._ledger = []
         batch_dispatched = False
-        batch_applied = False
 
         try:
             with self.store.transaction():
@@ -78,22 +79,25 @@ class StateRecorder:
                         script_lines.append(f"{cmd} && echo \"SUCCESS_{i}\" || exit $?")
                     script = "\n".join(script_lines)
                     batch_dispatched = True
-                    self.client.shell([], mutate=True, input_data=script)
-                    batch_applied = True
+                    timeout = max(
+                        AdbClient.DEFAULT_TIMEOUT_SECONDS,
+                        min(
+                            AdbClient.LONG_TIMEOUT_SECONDS,
+                            2 * len(self._batched_commands)
+                        )
+                    )
+                    self.client.shell([], mutate=True, input_data=script, timeout=timeout)
                     # If we reach here, batch shell succeeded.
                     if self.verify:
-                        for entry in self._ledger:
-                            self._verify_entry(entry)
-        except Exception as exc:
-            if batch_applied:
-                successful_indices = list(range(len(self._ledger)))
-                self._revert_ledger(successful_indices)
-            elif batch_dispatched:
-                stdout = getattr(getattr(exc, "result", None), "stdout", "")
-                successful_indices = [
-                    int(m.group(1)) for m in re.finditer(r"SUCCESS_(\d+)", stdout)
-                ]
-                self._revert_ledger(successful_indices)
+                        try:
+                            from .verification import verify_entries_batched
+                            verify_entries_batched(self.client, self._ledger)
+                        except CommandError:
+                            for entry in self._ledger:
+                                self._verify_entry(entry)
+        except Exception:
+            if batch_dispatched:
+                self._revert_ledger(list(range(len(self._ledger))))
             raise
         finally:
             self._in_transaction = False
@@ -168,6 +172,17 @@ class StateRecorder:
             if package in self.store.data["packages"]:
                 self.store.data["packages"][package]["enabled"] = None
                 self._cleanup_package_entry(package)
+        elif type_ == "netpolicy_restrict_background":
+            self.store.data["netpolicy"].pop("restrict_background", None)
+        elif type_ == "netpolicy_whitelist":
+            uid = str(entry["uid"])
+            self.store.data["netpolicy_whitelist"].pop(uid, None)
+        elif type_ == "deviceidle_whitelist":
+            package = str(entry["package"])
+            self.store.data["deviceidle_whitelist"].pop(package, None)
+        elif type_ == "app_hibernation":
+            package = str(entry["package"])
+            self.store.data["hibernation"].pop(package, None)
 
     def _remove_snapshots_for_entries(self, entries: List[AnyLedgerEntry]) -> None:
         for entry in entries:
@@ -214,6 +229,28 @@ class StateRecorder:
             pkg_entry = self._package_entry(package)
             if pkg_entry["enabled"] is None:
                 pkg_entry["enabled"] = entry.get("prior_value")
+        elif type_ == "netpolicy_restrict_background":
+            store = self.store.data["netpolicy"]
+            if "restrict_background" not in store:
+                store["restrict_background"] = entry.get("prior_value")
+        elif type_ == "netpolicy_whitelist":
+            store = self.store.data["netpolicy_whitelist"]
+            uid = str(entry.get("uid"))
+            if uid not in store:
+                store[uid] = {
+                    "package": entry.get("package"),
+                    "prior_member": entry.get("prior_member"),
+                }
+        elif type_ == "deviceidle_whitelist":
+            store = self.store.data["deviceidle_whitelist"]
+            package = str(entry.get("package"))
+            if package not in store:
+                store[package] = entry.get("prior_member")
+        elif type_ == "app_hibernation":
+            store = self.store.data["hibernation"]
+            package = str(entry.get("package"))
+            if package not in store:
+                store[package] = entry.get("prior_value")
 
     def prefetch_package_states(self) -> None:
         (
@@ -357,11 +394,37 @@ class StateRecorder:
         }))
 
     def _get_appop(self, package: str, op: str) -> str:
-        if not self._prefetch_appops_success:
-            raise SnapshotError(f"AppOps data was not collected or command failed for package: {package}")
-        if package not in self._appops_cache:
-             raise SnapshotError(f"Could not determine appops for package: {package}")
-        return self._appops_cache[package].get(op, "default")
+        if (
+            self._prefetch_appops_success
+            and package in self._appops_cache
+            and op in self._appops_cache[package]
+        ):
+            return self._appops_cache[package][op]
+
+        # Fallback read
+        try:
+            result = self.client.shell(["cmd", "appops", "get", package, op], check=False)
+        except Exception as exc:
+            raise SnapshotError(
+                f"Failed to execute cmd appops get for package {package} op {op}: {exc}"
+            ) from exc
+
+        if result.returncode != 0:
+            raise SnapshotError(
+                f"cmd appops get failed for package {package} op {op} "
+                f"with exit code {result.returncode}"
+            )
+
+        try:
+            from .verification import parse_appop_output
+            val = parse_appop_output(result.stdout)
+        except Exception as exc:
+            raise SnapshotError(
+                f"Failed to parse appop output for package {package} op {op}: {exc}"
+            ) from exc
+
+        self._appops_cache.setdefault(package, {})[op] = val
+        return val
 
     def snapshot_appop(self, package: str, op: str, new_value: Optional[str] = None) -> None:
         entry = self._package_entry(package)
@@ -378,9 +441,32 @@ class StateRecorder:
         }))
 
     def _get_standby_bucket(self, package: str) -> str:
-        if not self._prefetch_standby_bucket_success or package not in self._standby_bucket_cache:
-            raise SnapshotError(f"Could not determine standby bucket for package: {package}")
-        return self._standby_bucket_cache[package]
+        if self._prefetch_standby_bucket_success and package in self._standby_bucket_cache:
+            return self._standby_bucket_cache[package]
+
+        # Fallback to per-package am get-standby-bucket read
+        try:
+            result = self.client.shell(["am", "get-standby-bucket", package], check=False)
+        except Exception as exc:
+            raise SnapshotError(
+                f"Failed to execute am get-standby-bucket for package {package}: {exc}"
+            ) from exc
+
+        if result.returncode != 0:
+            raise SnapshotError(
+                f"Failed to read standby bucket for package {package}: "
+                f"exit code {result.returncode}"
+            )
+
+        val = result.stdout.strip()
+        if not val or not re.match(r"^[0-9a-zA-Z_]+$", val):
+            raise SnapshotError(
+                f"Failed to read standby bucket for package {package}: "
+                f"invalid output '{val}'"
+            )
+
+        self._standby_bucket_cache[package] = val
+        return val
 
     def snapshot_standby_bucket(self, package: str, new_value: Optional[str] = None) -> None:
         entry = self._package_entry(package)
@@ -449,6 +535,219 @@ class StateRecorder:
     def verify_package_enabled(self, package: str, expected_enabled: bool) -> None:
         verify_package_enabled(self.client, package, expected_enabled)
 
+    def verify_netpolicy_restrict_background(
+        self, expected_value: bool
+    ) -> None:
+        verify_netpolicy_restrict_background(self.client, expected_value)
+
+    def verify_netpolicy_whitelist(
+        self, package: str, uid: str, expected_member: bool
+    ) -> None:
+        verify_netpolicy_whitelist(self.client, package, uid, expected_member)
+
+    def verify_deviceidle_whitelist(
+        self, package: str, expected_member: bool
+    ) -> None:
+        verify_deviceidle_whitelist(self.client, package, expected_member)
+
+    def verify_app_hibernation(
+        self, package: str, expected_value: bool
+    ) -> None:
+        verify_app_hibernation(self.client, package, expected_value)
+
+    def snapshot_netpolicy_restrict_background(self, new_value: bool) -> None:
+        store = self.store.data["netpolicy"]
+        if "restrict_background" not in store:
+            try:
+                res = self.client.shell(
+                    ["cmd", "netpolicy", "get", "restrict-background"]
+                )
+                val = parse_netpolicy_toggle(res.stdout)
+            except Exception as exc:
+                raise SnapshotError(
+                    f"Failed to read netpolicy toggle: {exc}"
+                ) from exc
+            store["restrict_background"] = val
+            self.store.save()
+        self._ledger.append(
+            cast(
+                AnyLedgerEntry,
+                {
+                    "type": "netpolicy_restrict_background",
+                    "prior_value": store["restrict_background"],
+                    "new_value": new_value,
+                },
+            )
+        )
+
+    def set_netpolicy_restrict_background(
+        self, value: bool, verify: bool = True
+    ) -> None:
+        self.snapshot_netpolicy_restrict_background(new_value=value)
+        val_str = "true" if value else "false"
+        self._queue_or_run(
+            ["cmd", "netpolicy", "set", "restrict-background", val_str]
+        )
+        if not self._in_transaction and self.verify and verify:
+            try:
+                self.verify_netpolicy_restrict_background(value)
+            except VerificationError:
+                self._revert_ledger()
+                raise
+
+    def get_package_uid(self, package: str) -> str:
+        res = self.client.shell(["pm", "list", "packages", "-U", package])
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            match = re.match(
+                r"^package:"
+                + re.escape(package)
+                + r"\s+uid:(\d+)(?:\s|$)",
+                line,
+            )
+            if match:
+                return match.group(1)
+        raise SnapshotError(f"Could not resolve UID for package {package}")
+
+    def snapshot_netpolicy_whitelist(
+        self, package: str, uid: str, new_value: bool
+    ) -> None:
+        store = self.store.data["netpolicy_whitelist"]
+        if uid not in store:
+            try:
+                res = self.client.shell(
+                    [
+                        "cmd",
+                        "netpolicy",
+                        "list",
+                        "restrict-background-whitelist",
+                    ]
+                )
+                current_whitelist = parse_netpolicy_whitelist(res.stdout)
+            except Exception as exc:
+                raise SnapshotError(
+                    f"Failed to read netpolicy whitelist: {exc}"
+                ) from exc
+            prior_member = uid in current_whitelist
+            store[uid] = {"package": package, "prior_member": prior_member}
+            self.store.save()
+        else:
+            prior_member = store[uid]["prior_member"]
+
+        self._ledger.append(
+            cast(
+                AnyLedgerEntry,
+                {
+                    "type": "netpolicy_whitelist",
+                    "package": package,
+                    "uid": uid,
+                    "prior_member": prior_member,
+                    "new_value": new_value,
+                },
+            )
+        )
+
+    def add_netpolicy_whitelist(
+        self, package: str, verify: bool = True
+    ) -> None:
+        uid = self.get_package_uid(package)
+        self.snapshot_netpolicy_whitelist(package, uid, new_value=True)
+        self._queue_or_run(
+            ["cmd", "netpolicy", "add", "restrict-background-whitelist", uid]
+        )
+        if not self._in_transaction and self.verify and verify:
+            try:
+                self.verify_netpolicy_whitelist(package, uid, True)
+            except VerificationError:
+                self._revert_ledger()
+                raise
+
+    def snapshot_deviceidle_whitelist(
+        self, package: str, new_value: bool
+    ) -> None:
+        store = self.store.data["deviceidle_whitelist"]
+        if package not in store:
+            try:
+                res = self.client.shell(["cmd", "deviceidle", "whitelist"])
+                user_whitelist = parse_deviceidle_whitelist(res.stdout)
+            except Exception as exc:
+                raise SnapshotError(
+                    f"Failed to read deviceidle whitelist: {exc}"
+                ) from exc
+            prior_member = package in user_whitelist
+            store[package] = prior_member
+            self.store.save()
+        else:
+            prior_member = store[package]
+
+        self._ledger.append(
+            cast(
+                AnyLedgerEntry,
+                {
+                    "type": "deviceidle_whitelist",
+                    "package": package,
+                    "prior_member": prior_member,
+                    "new_value": new_value,
+                },
+            )
+        )
+
+    def remove_deviceidle_whitelist(
+        self, package: str, verify: bool = True
+    ) -> None:
+        self.snapshot_deviceidle_whitelist(package, new_value=False)
+        self._queue_or_run(["cmd", "deviceidle", "whitelist", f"-{package}"])
+        if not self._in_transaction and self.verify and verify:
+            try:
+                self.verify_deviceidle_whitelist(package, False)
+            except VerificationError:
+                self._revert_ledger()
+                raise
+
+    def snapshot_app_hibernation(self, package: str, new_value: bool) -> None:
+        store = self.store.data["hibernation"]
+        if package not in store:
+            try:
+                res = self.client.shell(
+                    ["cmd", "app_hibernation", "get-state", package]
+                )
+                val = parse_hibernation_state(res.stdout)
+            except Exception as exc:
+                raise SnapshotError(
+                    f"Failed to read hibernation state for {package}: {exc}"
+                ) from exc
+            store[package] = val
+            self.store.save()
+        else:
+            val = store[package]
+
+        self._ledger.append(
+            cast(
+                AnyLedgerEntry,
+                {
+                    "type": "app_hibernation",
+                    "package": package,
+                    "prior_value": val,
+                    "new_value": new_value,
+                },
+            )
+        )
+
+    def set_app_hibernation(
+        self, package: str, value: bool, verify: bool = True
+    ) -> None:
+        self.snapshot_app_hibernation(package, new_value=value)
+        val_str = "true" if value else "false"
+        self._queue_or_run(
+            ["cmd", "app_hibernation", "set-state", package, val_str]
+        )
+        if not self._in_transaction and self.verify and verify:
+            try:
+                self.verify_app_hibernation(package, value)
+            except VerificationError:
+                self._revert_ledger()
+                raise
+
     def _verify_entry(self, entry: AnyLedgerEntry) -> None:
         type_ = entry["type"]
         new_value = entry.get("new_value")
@@ -470,6 +769,16 @@ class StateRecorder:
             self.verify_standby_bucket(str(entry["package"]), str(new_value))
         elif type_ == "package_enabled":
             self.verify_package_enabled(str(entry["package"]), bool(new_value))
+        elif type_ == "netpolicy_restrict_background":
+            self.verify_netpolicy_restrict_background(bool(new_value))
+        elif type_ == "netpolicy_whitelist":
+            self.verify_netpolicy_whitelist(
+                str(entry["package"]), str(entry["uid"]), bool(new_value)
+            )
+        elif type_ == "deviceidle_whitelist":
+            self.verify_deviceidle_whitelist(str(entry["package"]), bool(new_value))
+        elif type_ == "app_hibernation":
+            self.verify_app_hibernation(str(entry["package"]), bool(new_value))
 
     def restore(self) -> List[str]:
         return restore_state(self.client, self.store, self._remove_snapshot_for_entry)

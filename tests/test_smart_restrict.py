@@ -65,16 +65,33 @@ class TestSmartRestrict(unittest.TestCase):
         # Diagnostics dependencies
         self.runner.responses["adb -s test_device shell am get-standby-bucket com.example.app"] = CommandResult(0, "active", "")
         self.runner.responses["adb -s test_device shell cmd appops get com.example.app RUN_ANY_IN_BACKGROUND"] = CommandResult(0, "allow", "")
+        self.runner.responses["adb -s test_device shell cmd appops get com.example.app WAKE_LOCK"] = CommandResult(0, "default", "")
         self.runner.responses["adb -s test_device shell am get-standby-bucket com.example.aggressive"] = CommandResult(0, "active", "")
         self.runner.responses["adb -s test_device shell cmd appops get com.example.aggressive RUN_ANY_IN_BACKGROUND"] = CommandResult(0, "allow", "")
+        self.runner.responses["adb -s test_device shell cmd appops get com.example.aggressive WAKE_LOCK"] = CommandResult(0, "default", "")
         self.runner.responses["adb -s test_device shell am get-standby-bucket com.critical.launcher"] = CommandResult(0, "active", "")
         self.runner.responses["adb -s test_device shell cmd appops get com.critical.launcher RUN_ANY_IN_BACKGROUND"] = CommandResult(0, "allow", "")
+        self.runner.responses["adb -s test_device shell cmd appops get com.critical.launcher WAKE_LOCK"] = CommandResult(0, "default", "")
         
-        # Make `com.example.app` restrict
-        self.runner.responses["adb -s test_device shell dumpsys alarm"] = CommandResult(0, "com.example.app\ncom.example.aggressive", "")
-        # Make `com.example.aggressive` aggressive_restrict
-        self.runner.responses["adb -s test_device shell dumpsys jobscheduler"] = CommandResult(0, "com.example.aggressive", "")
-        self.runner.responses["adb -s test_device shell dumpsys batterystats --charged"] = CommandResult(0, "com.example.aggressive", "")
+        # Make `com.example.app` restrict and `com.example.aggressive` aggressive_restrict
+        alarm_out = (
+            "    +1m20s000ms running, 150 wakeups, 150 alarms: u0a123:com.example.app\n"
+            "    +2m30s000ms running, 1200 wakeups, 1200 alarms: u0a274:com.example.aggressive\n"
+        )
+        self.runner.responses["adb -s test_device shell dumpsys alarm"] = CommandResult(0, alarm_out, "")
+        
+        # Make `com.example.aggressive` aggressive_restrict using jobs and checkin
+        job_out = "JOB u0a274:com.example.aggressive\n"
+        self.runner.responses["adb -s test_device shell dumpsys jobscheduler"] = CommandResult(0, job_out, "")
+        
+        bs_out = (
+            "9,0,i,uid,10001,com.example.app\n"
+            "9,10001,l,wl,mywakelock,0,f,0,700000,p,1\n"
+            "9,0,i,uid,10002,com.example.aggressive\n"
+            "9,10002,l,wl,mywakelock,0,f,0,3700000,p,1\n"
+        )
+        self.runner.responses["adb -s test_device shell dumpsys batterystats --checkin"] = CommandResult(0, bs_out, "")
+        self.runner.responses["adb -s test_device shell cmd deviceidle whitelist"] = CommandResult(0, "", "")
         
         # Critical apps setup
         self.runner.responses["adb -s test_device shell cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME"] = CommandResult(0, "packageName=com.critical.launcher", "")

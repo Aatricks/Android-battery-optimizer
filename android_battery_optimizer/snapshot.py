@@ -1,5 +1,6 @@
 import re
 from typing import Dict, Tuple
+
 from .adb import AdbClient, CommandError
 
 PACKAGE_USER_ID = "0"
@@ -33,6 +34,16 @@ def read_device_config_namespace(client: AdbClient, namespace: str) -> Dict[str,
             cache[k.strip()] = v.strip()
     return cache
 
+def parse_usagestats(output: str) -> Dict[str, str]:
+    cache = {}
+    for line in output.splitlines():
+        if "package=" in line and "bucket=" in line:
+            pkg_match = re.search(r"package=([a-zA-Z0-9_\.]+)", line)
+            bucket_match = re.search(r"bucket=(\d+|[a-zA-Z_]+)", line)
+            if pkg_match and bucket_match:
+                cache[pkg_match.group(1)] = bucket_match.group(1)
+    return cache
+
 def prefetch_package_states(client: AdbClient) -> Tuple[bool, Dict[str, bool], bool, Dict[str, Dict[str, str]], bool, Dict[str, str]]:
     package_enabled_cache: Dict[str, bool] = {}
     appops_cache: Dict[str, Dict[str, str]] = {}
@@ -61,15 +72,28 @@ def prefetch_package_states(client: AdbClient) -> Tuple[bool, Dict[str, bool], b
         appops = client.shell_text(["dumpsys", "appops"])
         current_pkg = None
         for line in appops.splitlines():
-            pkg_match = re.search(r"Package\s+([a-zA-Z0-9_\.]+):", line)
-            if pkg_match:
-                current_pkg = pkg_match.group(1)
-                appops_cache.setdefault(current_pkg, {})
+            stripped = line.strip()
+            if stripped.startswith("Package "):
+                pkg_match = re.search(r"Package\s+([a-zA-Z0-9_\.]+):", line)
+                if pkg_match:
+                    current_pkg = pkg_match.group(1)
+                    appops_cache.setdefault(current_pkg, {})
+                else:
+                    current_pkg = None
                 continue
+            elif stripped.startswith("Op ") or stripped.startswith("Uid "):
+                current_pkg = None
+                continue
+
             if current_pkg:
                 op_match = re.search(r"\s+([A-Z_a-z0-9]+):\s*([a-zA-Z0-9_]+)", line)
                 if op_match:
                     appops_cache.setdefault(current_pkg, {})[op_match.group(1)] = op_match.group(2)
+                    continue
+                op_match = re.search(r"\s+([A-Z_a-z0-9]+)\s+\(([a-zA-Z0-9_]+)\):", line)
+                if op_match:
+                    appops_cache.setdefault(current_pkg, {})[op_match.group(1)] = op_match.group(2)
+                    continue
         prefetch_appops_success = True
     except CommandError:
         pass
@@ -77,12 +101,7 @@ def prefetch_package_states(client: AdbClient) -> Tuple[bool, Dict[str, bool], b
     prefetch_standby_bucket_success = False
     try:
         usagestats = client.shell_text(["dumpsys", "usagestats"])
-        for line in usagestats.splitlines():
-            if "package=" in line and "bucket=" in line:
-                pkg_match = re.search(r"package=([a-zA-Z0-9_\.]+)", line)
-                bucket_match = re.search(r"bucket=(\d+|[a-zA-Z_]+)", line)
-                if pkg_match and bucket_match:
-                    standby_bucket_cache[pkg_match.group(1)] = bucket_match.group(1)
+        standby_bucket_cache = parse_usagestats(usagestats)
         prefetch_standby_bucket_success = True
     except CommandError:
         pass
