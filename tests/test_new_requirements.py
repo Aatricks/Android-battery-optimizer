@@ -2,13 +2,14 @@ import unittest
 import tempfile
 import shutil
 import argparse
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 import time
 from android_battery_optimizer.adb import AdbClient, CommandRunner, CommandResult
 from android_battery_optimizer.app import BatteryOptimizerApp
 from android_battery_optimizer.cli import BatteryOptimizerCLI
 from android_battery_optimizer.diagnose import Diagnoser
+from android_battery_optimizer.verification import VerificationError
 
 class FakeRunner(CommandRunner):
     def __init__(self):
@@ -89,11 +90,16 @@ class TestNewRequirements(unittest.TestCase):
         self.runner.responses["adb -s test_device shell dumpsys jobscheduler"] = CommandResult(0, "JOB u0a101:com.example.app\n", "")
         bs_out = (
             "9,0,i,uid,10001,com.example.app\n"
+            "9,10001,l,wua,alarm,1200\n"
             "9,10001,l,wl,mywakelock,0,f,0,3700000,p,1\n"
             "9,0,i,uid,10002,com.example.recent\n"
+            "9,10002,l,wua,alarm,150\n"
             "9,10002,l,wl,mywakelock,0,f,0,700000,p,1\n"
         )
         self.runner.responses["adb -s test_device shell dumpsys batterystats --checkin"] = CommandResult(0, bs_out, "")
+        self.runner.responses["adb -s test_device shell dumpsys batterystats --charged"] = CommandResult(
+            0, "  Time on battery: 2h 0m 0s 0ms (100.0%) realtime\n", ""
+        )
         self.runner.responses["adb -s test_device shell cmd deviceidle whitelist"] = CommandResult(0, "", "")
         
         now_ms = int(time.time() * 1000)
@@ -358,6 +364,59 @@ class TestNewRequirements(unittest.TestCase):
         self.assertNotIn("min_refresh_rate", applied_commands)
         self.assertNotIn("low_power", applied_commands)
 
+    def test_parse_builtin_display_refresh_rates(self):
+        from android_battery_optimizer.android import parse_builtin_refresh_rates
+
+        output = (
+            'DisplayDeviceInfo{"Built-in Screen": supportedRefreshRates '
+            "[120.00001, 96.0, 60.0, 10.0]}\n"
+            'DisplayDeviceInfo{"External Screen": supportedRefreshRates '
+            "[144.0, 60.0]}"
+        )
+
+        self.assertEqual(
+            parse_builtin_refresh_rates(output),
+            [10.0, 60.0, 96.0, 120.00001],
+        )
+
+    def test_120hz_endurance_refuses_device_without_120hz(self):
+        with (
+            patch.object(self.app, "_display_supports_120hz", return_value=False),
+            patch.object(self.app, "apply_experimental_optimizations") as apply_profile,
+        ):
+            with self.assertRaisesRegex(ValueError, "120 Hz"):
+                self.app.apply_120hz_endurance_profile()
+
+        apply_profile.assert_not_called()
+
+    def test_120hz_endurance_restores_if_120hz_is_lost(self):
+        with (
+            patch.object(
+                self.app,
+                "_display_supports_120hz",
+                side_effect=[True, False],
+            ),
+            patch.object(self.app, "apply_experimental_optimizations") as apply_profile,
+            patch.object(self.app, "revert_saved_state", return_value=[]) as restore,
+        ):
+            with self.assertRaises(VerificationError):
+                self.app.apply_120hz_endurance_profile()
+
+        apply_profile.assert_called_once()
+        restore.assert_called_once()
+
+    def test_120hz_endurance_keeps_refresh_settings_untouched(self):
+        with patch.object(
+            self.app,
+            "_display_supports_120hz",
+            side_effect=[True, True],
+        ):
+            self.app.apply_120hz_endurance_profile()
+
+        applied_commands = " ".join(self.runner.commands)
+        self.assertNotIn("peak_refresh_rate", applied_commands)
+        self.assertNotIn("min_refresh_rate", applied_commands)
+
     def test_doze_profile_and_battery_saver_constants(self):
         self.runner.commands.clear()
         self.runner.responses["adb -s test_device shell getprop ro.product.brand; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.build.fingerprint"] = CommandResult(
@@ -441,7 +500,7 @@ class TestNewRequirements(unittest.TestCase):
         )
         bs_fixture_with_uid = bs_fixture + "9,0,i,uid,10100,com.example.pkg\n"
         wls = parse_wakelock_ms(bs_fixture_with_uid)
-        self.assertEqual(wls.get("com.example.pkg"), 3600000)
+        self.assertEqual(wls.get("com.example.pkg"), 3600)
         
         jobs_fixture = (
             "  JOB companion:1000/1: dc16cd7 @companion@android/com.android.server.companion.association.InactiveAssociationsRemovalService\n"
@@ -453,22 +512,24 @@ class TestNewRequirements(unittest.TestCase):
     def test_recommendation_thresholds(self):
         diag = Diagnoser(self.client)
         
-        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 1000, "wakelock_partial_ms": 0, "jobs_registered": 0})
+        sufficient = {"observation_ms": 3600000}
+
+        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 1000, "wakelock_partial_ms": 0, "jobs_registered": 0, **sufficient})
         self.assertEqual(rec, "aggressive_restrict")
         
-        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 0, "wakelock_partial_ms": 3600000, "jobs_registered": 0})
+        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 0, "wakelock_partial_ms": 3600000, "jobs_registered": 0, **sufficient})
         self.assertEqual(rec, "aggressive_restrict")
         
-        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 100, "wakelock_partial_ms": 0, "jobs_registered": 0})
+        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 100, "wakelock_partial_ms": 0, "jobs_registered": 0, **sufficient})
         self.assertEqual(rec, "restrict")
         
-        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 0, "wakelock_partial_ms": 600000, "jobs_registered": 0})
+        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 0, "wakelock_partial_ms": 600000, "jobs_registered": 0, **sufficient})
         self.assertEqual(rec, "restrict")
         
-        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 0, "wakelock_partial_ms": 0, "jobs_registered": 100})
+        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 0, "wakelock_partial_ms": 0, "jobs_registered": 100, **sufficient})
         self.assertEqual(rec, "restrict")
         
-        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 99, "wakelock_partial_ms": 599999, "jobs_registered": 99})
+        rec, _ = diag._recommend("active", "allow", {"alarm_wakeups": 99, "wakelock_partial_ms": 599999, "jobs_registered": 99, **sufficient})
         self.assertEqual(rec, "keep")
 
     def test_batched_verification_scenarios(self):

@@ -46,6 +46,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser_sam = add_subparser("apply-samsung-experimental", help="Applies Samsung experimental optimizations")
     parser_sam.add_argument("--yes", action="store_true", help="Confirm Samsung experimental optimizations")
 
+    parser_endurance = add_subparser(
+        "apply-120hz-endurance",
+        help="Apply the reversible endurance profile while preserving 120 Hz",
+    )
+    parser_endurance.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the 120 Hz endurance profile",
+    )
+
     parser_restrict = add_subparser("restrict-apps", help="Restrict background apps")
     parser_restrict.add_argument("--level", choices=["ignore", "deny", "allow"], default="ignore")
     parser_restrict.add_argument("--yes", action="store_true", help="Confirm restriction")
@@ -274,6 +284,18 @@ class BatteryOptimizerCLI:
                 self.output("Applying Samsung experimental optimizations...")
                 self.app.apply_samsung_experimental_optimizations()
                 self.output("Samsung experimental optimizations applied.")
+                return 0
+
+            elif args.command == "apply-120hz-endurance":
+                if not args.yes:
+                    self.output(
+                        "Error: --yes is required for the 120 Hz endurance "
+                        "profile in non-interactive mode."
+                    )
+                    return 1
+                self.output("Applying the reversible 120 Hz endurance profile...")
+                self.app.apply_120hz_endurance_profile()
+                self.output("120 Hz endurance profile applied and verified.")
                 return 0
 
             elif args.command == "restrict-apps":

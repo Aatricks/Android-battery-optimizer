@@ -61,6 +61,32 @@ class TestCLICommands(unittest.TestCase):
         self.assertEqual(args.command, "smart-restrict")
         self.assertTrue(args.dry_run)
 
+    def test_parse_120hz_endurance_subcommand(self):
+        args = parse_args(["apply-120hz-endurance", "--yes"])
+        self.assertEqual(args.command, "apply-120hz-endurance")
+        self.assertTrue(args.yes)
+
+    @patch("android_battery_optimizer.cli.BatteryOptimizerCLI.check_environment")
+    @patch("android_battery_optimizer.app.BatteryOptimizerApp.apply_120hz_endurance_profile")
+    def test_120hz_endurance_requires_yes(self, mock_apply, mock_check_env):
+        mock_check_env.return_value = True
+        outputs = []
+        app = BatteryOptimizerApp(
+            client=AdbClient(runner=SubprocessRunner(), output=lambda _: None),
+            state_dir=self.state_dir,
+        )
+        cli = BatteryOptimizerCLI(app=app, output=outputs.append)
+
+        result = cli.run_command(parse_args(["apply-120hz-endurance"]))
+        self.assertEqual(result, 1)
+        mock_apply.assert_not_called()
+
+        result = cli.run_command(
+            parse_args(["apply-120hz-endurance", "--yes"])
+        )
+        self.assertEqual(result, 0)
+        mock_apply.assert_called_once()
+
     @patch("android_battery_optimizer.cli.BatteryOptimizerCLI.check_environment")
     @patch("android_battery_optimizer.app.BatteryOptimizerApp.get_device_info")
     @patch("android_battery_optimizer.app.BatteryOptimizerApp.apply_experimental_optimizations")

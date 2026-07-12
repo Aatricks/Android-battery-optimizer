@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
@@ -38,3 +39,20 @@ def resolve_package_choice(query: str, packages: Sequence[str]) -> List[str]:
         return [pkg for pkg in packages if pkg == normalized]
     lowered = normalized.lower()
     return [pkg for pkg in packages if lowered in pkg.lower()]
+
+
+def parse_builtin_refresh_rates(output: str) -> List[float]:
+    for line in output.splitlines():
+        if "Built-in Screen" not in line or "supportedRefreshRates" not in line:
+            continue
+        match = re.search(r"supportedRefreshRates \[([^]]+)\]", line)
+        if not match:
+            continue
+        try:
+            return sorted(
+                float(value.strip())
+                for value in match.group(1).split(",")
+            )
+        except ValueError:
+            return []
+    return []

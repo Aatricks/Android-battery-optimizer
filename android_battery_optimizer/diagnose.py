@@ -1,3 +1,4 @@
+import csv
 import re
 from typing import Any, Dict, List, Optional
 
@@ -5,11 +6,100 @@ from .adb import AdbClient
 from .snapshot import parse_usagestats
 from .verification import parse_appop_output, parse_deviceidle_whitelist
 
+MIN_RESTRICTION_OBSERVATION_MS = 60 * 60 * 1000
+
+
+def parse_duration_ms(value: str) -> Optional[int]:
+    match = re.fullmatch(
+        r"(?:(\d+)d )?(?:(\d+)h )?(?:(\d+)m )?(?:(\d+)s )?(\d+)ms",
+        value.strip(),
+    )
+    if not match:
+        return None
+    days, hours, minutes, seconds, milliseconds = (
+        int(part or 0) for part in match.groups()
+    )
+    return (
+        days * 24 * 60 * 60 * 1000
+        + hours * 60 * 60 * 1000
+        + minutes * 60 * 1000
+        + seconds * 1000
+        + milliseconds
+    )
+
+
+def parse_battery_summary(output: str) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "observation_ms": None,
+        "screen_off_ms": None,
+        "screen_on_drain_percent": None,
+        "screen_off_drain_percent": None,
+        "power_mah": {},
+    }
+    component_names = {
+        "screen",
+        "cpu",
+        "bluetooth",
+        "mobile_radio",
+        "sensors",
+        "wifi",
+        "wakelock",
+        "ambient_display",
+    }
+    in_global_power = False
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Time on battery:"):
+            duration = stripped.split(":", 1)[1].split("(", 1)[0].strip()
+            summary["observation_ms"] = parse_duration_ms(duration)
+        elif stripped.startswith("Time on battery screen off:"):
+            duration = stripped.split(":", 1)[1].split("(", 1)[0].strip()
+            summary["screen_off_ms"] = parse_duration_ms(duration)
+        elif stripped.startswith("Amount discharged while screen on:"):
+            summary["screen_on_drain_percent"] = int(stripped.rsplit(" ", 1)[1])
+        elif stripped.startswith("Amount discharged while screen off:"):
+            summary["screen_off_drain_percent"] = int(stripped.rsplit(" ", 1)[1])
+        elif stripped == "Global":
+            in_global_power = True
+        elif in_global_power:
+            if stripped.startswith("(") or stripped.startswith("UID "):
+                in_global_power = False
+                continue
+            match = re.match(r"([a-z_]+):\s+([0-9.]+)", stripped)
+            if match and match.group(1) in component_names:
+                summary["power_mah"][match.group(1)] = float(match.group(2))
+
+    return summary
+
 
 def parse_alarm_wakeups(output: str) -> Dict[str, int]:
     pkg_wakeups = {}
     if not output:
         return pkg_wakeups
+
+    rows = list(csv.reader(output.splitlines()))
+    uid_to_pkgs: Dict[str, set[str]] = {}
+    for fields in rows:
+        if len(fields) >= 6 and fields[3] == "uid":
+            uid_to_pkgs.setdefault(fields[4], set()).add(fields[5])
+
+    checkin_rows = [
+        fields for fields in rows if len(fields) >= 6 and fields[3] == "wua"
+    ]
+    if checkin_rows:
+        for fields in checkin_rows:
+            packages = uid_to_pkgs.get(fields[1], set())
+            if len(packages) != 1:
+                continue
+            try:
+                count = int(fields[-1])
+            except ValueError:
+                continue
+            package = next(iter(packages))
+            pkg_wakeups[package] = pkg_wakeups.get(package, 0) + count
+        return pkg_wakeups
+
     # Match wakeups, alarms: <uid-ish>:<package>
     # e.g., "  6994 wakeups, 6994 alarms: u0a274:com.google.android.gms"
     pattern = re.compile(
@@ -30,11 +120,7 @@ def parse_wakelock_ms(output: str) -> Dict[str, int]:
     if not output:
         return pkg_wakelocks
 
-    lines = [
-        line.strip().split(",")
-        for line in output.splitlines()
-        if line.strip()
-    ]
+    lines = list(csv.reader(output.splitlines()))
 
     # First pass: UID -> package mappings
     # e.g., "9,0,i,uid,1000,com.samsung.android.provider.filterprovider"
@@ -48,15 +134,15 @@ def parse_wakelock_ms(output: str) -> Dict[str, int]:
     for fields in lines:
         if len(fields) >= 4 and fields[3] == "wl":
             uid = fields[1]
-            if uid in uid_to_pkgs:
+            if uid in uid_to_pkgs and len(uid_to_pkgs[uid]) == 1:
                 try:
                     p_idx = fields.index("p")
                     if p_idx > 0:
-                        partial_ms = int(fields[p_idx - 1])
-                        for pkg in uid_to_pkgs[uid]:
-                            pkg_wakelocks[pkg] = (
-                                pkg_wakelocks.get(pkg, 0) + partial_ms
-                            )
+                        partial_ms = int(fields[p_idx - 1]) // 1000
+                        pkg = next(iter(uid_to_pkgs[uid]))
+                        pkg_wakelocks[pkg] = (
+                            pkg_wakelocks.get(pkg, 0) + partial_ms
+                        )
                 except (ValueError, IndexError):
                     continue
 
@@ -92,10 +178,11 @@ class Diagnoser:
                 ["batterystats", "--checkin"],
                 timeout=self.client.LONG_TIMEOUT_SECONDS,
             ),
-            "usagestats": self._safe_dumpsys(["usagestats"]),
-            "alarm": self._safe_dumpsys(
-                ["alarm"], timeout=self.client.LONG_TIMEOUT_SECONDS
+            "batterystats_charged": self._safe_dumpsys(
+                ["batterystats", "--charged"],
+                timeout=self.client.LONG_TIMEOUT_SECONDS,
             ),
+            "usagestats": self._safe_dumpsys(["usagestats"]),
             "jobscheduler": self._safe_dumpsys(["jobscheduler"]),
         }
 
@@ -125,14 +212,17 @@ class Diagnoser:
 
         # Parse measurements
         alarm_map = (
-            parse_alarm_wakeups(dumpsys_outputs["alarm"])
-            if dumpsys_outputs["alarm"]
+            parse_alarm_wakeups(dumpsys_outputs["batterystats"])
+            if dumpsys_outputs["batterystats"]
             else None
         )
         wakelock_map = (
             parse_wakelock_ms(dumpsys_outputs["batterystats"])
             if dumpsys_outputs["batterystats"]
             else None
+        )
+        system_summary = parse_battery_summary(
+            dumpsys_outputs["batterystats_charged"]
         )
 
         results = []
@@ -173,6 +263,7 @@ class Diagnoser:
                 "wakelock_partial_ms": wakelock_partial_ms,
                 "jobs_registered": jobs_registered,
                 "last_used": last_used,
+                "observation_ms": system_summary["observation_ms"],
             }
 
             rec, reason = self._recommend(bucket, appops, signals)
@@ -191,6 +282,7 @@ class Diagnoser:
         return {
             "device": device,
             "warnings": self.warnings,
+            "system": system_summary,
             "packages": results,
             "doze_whitelist_user": doze_whitelist_user,
         }
@@ -291,6 +383,13 @@ class Diagnoser:
         alarm_wakeups = signals.get("alarm_wakeups")
         wakelock_ms = signals.get("wakelock_partial_ms")
         jobs = signals.get("jobs_registered")
+        observation_ms = signals.get("observation_ms")
+
+        if (
+            observation_ms is None
+            or observation_ms < MIN_RESTRICTION_OBSERVATION_MS
+        ):
+            return "keep", "Insufficient observation window (minimum 1 hour)"
 
         # Threshold checks: treat None as 0
         w_alarm = alarm_wakeups if alarm_wakeups is not None else 0

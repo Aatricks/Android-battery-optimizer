@@ -2,7 +2,13 @@ import unittest
 from unittest.mock import MagicMock
 from android_battery_optimizer.adb import AdbClient, CommandRunner, CommandResult, CommandError
 from android_battery_optimizer.app import BatteryOptimizerApp
-from android_battery_optimizer.diagnose import Diagnoser
+from android_battery_optimizer.diagnose import (
+    Diagnoser,
+    parse_alarm_wakeups,
+    parse_battery_summary,
+    parse_duration_ms,
+    parse_wakelock_ms,
+)
 
 class FakeRunner(CommandRunner):
     def __init__(self):
@@ -54,8 +60,9 @@ class TestDiagnose(unittest.TestCase):
             self.assertNotIn("disable", cmd)
 
     def test_diagnose_continues_on_failure(self):
-        # Make alarm dumpsys fail
-        self.runner.responses["adb -s test_device shell dumpsys alarm"] = CommandError("timeout", CommandResult(-1, "", ""))
+        self.runner.responses[
+            "adb -s test_device shell dumpsys batterystats --checkin"
+        ] = CommandError("timeout", CommandResult(-1, "", ""))
         
         diagnoser = Diagnoser(self.client)
         report = diagnoser.run(third_party_only=True)
@@ -64,11 +71,13 @@ class TestDiagnose(unittest.TestCase):
         self.assertEqual(len(report["packages"]), 2)
         
         # Emit warning
-        self.assertTrue(any("alarm failed" in w for w in report["warnings"]))
+        self.assertTrue(any("batterystats --checkin failed" in w for w in report["warnings"]))
 
     def test_diagnose_emits_json_with_warnings(self):
         # Make one command fail
-        self.runner.responses["adb -s test_device shell dumpsys alarm"] = CommandError("timeout", CommandResult(-1, "", ""))
+        self.runner.responses[
+            "adb -s test_device shell dumpsys batterystats --checkin"
+        ] = CommandError("timeout", CommandResult(-1, "", ""))
         
         diagnoser = Diagnoser(self.client)
         report = diagnoser.run(third_party_only=True)
@@ -102,3 +111,78 @@ class TestDiagnose(unittest.TestCase):
         self.assertTrue(diagnoser._has_package_signal("com.foo", "package=com.foo "))
         self.assertTrue(diagnoser._has_package_signal("com.foo", "package:com.foo"))
         self.assertTrue(diagnoser._has_package_signal("com.foo", '"com.foo"'))
+
+    def test_wakelock_checkin_microseconds_are_converted_to_milliseconds(self):
+        output = (
+            "9,0,i,uid,10100,com.example.app\n"
+            "9,10100,l,wl,example,0,f,0,3600000000,p,1\n"
+        )
+
+        self.assertEqual(parse_wakelock_ms(output), {"com.example.app": 3600000})
+
+    def test_checkin_wakeup_alarms_are_mapped_to_package(self):
+        output = (
+            "9,0,i,uid,10100,com.example.app\n"
+            '9,10100,l,wua,"alarm,tag",70\n'
+            '9,10100,l,wua,"other",30\n'
+        )
+
+        self.assertEqual(parse_alarm_wakeups(output), {"com.example.app": 100})
+
+    def test_shared_uid_wakelock_is_not_attributed_to_each_package(self):
+        output = (
+            "9,0,i,uid,10100,com.example.one\n"
+            "9,0,i,uid,10100,com.example.two\n"
+            "9,10100,l,wl,example,0,f,0,3600000000,p,1\n"
+        )
+
+        self.assertEqual(parse_wakelock_ms(output), {})
+
+    def test_duration_parser_accepts_multi_day_windows(self):
+        self.assertEqual(
+            parse_duration_ms("1d 2h 3m 4s 5ms"),
+            93784005,
+        )
+
+    def test_parse_battery_summary_extracts_window_drain_and_components(self):
+        output = (
+            "  Time on battery: 2h 30m 0s 0ms (100.0%) realtime\n"
+            "  Time on battery screen off: 1h 0m 0s 0ms (40.0%) realtime\n"
+            "    Amount discharged while screen on: 12\n"
+            "    Amount discharged while screen off: 3\n"
+            "    Global\n"
+            "    screen: 141 apps: 141\n"
+            "    cpu: 233 apps: 231 duration: 1h 53m 50s 613ms\n"
+            "    bluetooth: 10.6 apps: 10.4\n"
+            "    mobile_radio: 7.87 apps: 2.54\n"
+            "    sensors: 6.47 apps: 6.47\n"
+            "    wifi: 2.30 apps: 2.13\n"
+            "    wakelock: 6.46 apps: 6.46 duration: 13m 10s 424ms\n"
+        )
+
+        summary = parse_battery_summary(output)
+
+        self.assertEqual(summary["observation_ms"], 9000000)
+        self.assertEqual(summary["screen_off_ms"], 3600000)
+        self.assertEqual(summary["screen_on_drain_percent"], 12)
+        self.assertEqual(summary["screen_off_drain_percent"], 3)
+        self.assertEqual(summary["power_mah"]["screen"], 141.0)
+        self.assertEqual(summary["power_mah"]["cpu"], 233.0)
+        self.assertEqual(summary["power_mah"]["bluetooth"], 10.6)
+
+    def test_short_observation_window_never_recommends_restriction(self):
+        diagnoser = Diagnoser(self.client)
+
+        recommendation, reason = diagnoser._recommend(
+            "active",
+            "allow",
+            {
+                "alarm_wakeups": 5000,
+                "wakelock_partial_ms": 7200000,
+                "jobs_registered": 500,
+                "observation_ms": 3599999,
+            },
+        )
+
+        self.assertEqual(recommendation, "keep")
+        self.assertIn("Insufficient observation window", reason)

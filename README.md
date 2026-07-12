@@ -92,6 +92,7 @@ The tool supports direct subcommands for automation:
 | `apply-safe` | Applies documented safe optimizations |
 | `apply-experimental --yes` | Applies experimental optimizations (accelerated Doze constants, force dark mode, screen timeout, disabled AOD/wifi-scan, Netpolicy Data Saver/exemptions; does not write `low_power` or touch refresh-rate) |
 | `apply-samsung-experimental --yes` | Applies Samsung optimizations (AOD off; preserves GOS; never touches refresh-rate) |
+| `apply-120hz-endurance --yes` | Applies the reversible experimental profile only when the built-in display supports 120 Hz, then verifies 120 Hz remains available |
 | `restrict-apps --level {ignore,deny,allow} --yes` | Restrict background apps |
 | `revert` | Restores saved state for the selected device |
 | `doctor-state` | Check saved state for non-restorable standby bucket entries |

@@ -86,11 +86,16 @@ class TestSmartRestrict(unittest.TestCase):
         
         bs_out = (
             "9,0,i,uid,10001,com.example.app\n"
+            "9,10001,l,wua,alarm,150\n"
             "9,10001,l,wl,mywakelock,0,f,0,700000,p,1\n"
             "9,0,i,uid,10002,com.example.aggressive\n"
+            "9,10002,l,wua,alarm,1200\n"
             "9,10002,l,wl,mywakelock,0,f,0,3700000,p,1\n"
         )
         self.runner.responses["adb -s test_device shell dumpsys batterystats --checkin"] = CommandResult(0, bs_out, "")
+        self.runner.responses["adb -s test_device shell dumpsys batterystats --charged"] = CommandResult(
+            0, "  Time on battery: 2h 0m 0s 0ms (100.0%) realtime\n", ""
+        )
         self.runner.responses["adb -s test_device shell cmd deviceidle whitelist"] = CommandResult(0, "", "")
         
         # Critical apps setup
@@ -116,6 +121,60 @@ class TestSmartRestrict(unittest.TestCase):
         for cmd in self.runner.commands:
             if "appops set com.critical.launcher" in cmd:
                 self.fail("Critical app was modified")
+
+    def test_protects_notification_sync_and_companion_packages(self):
+        installed = (
+            "package:com.example.app\n"
+            "package:com.example.aggressive\n"
+            "package:com.critical.launcher\n"
+            "package:com.example.notifications\n"
+            "package:com.example.mail\n"
+            "package:com.example.wearable"
+        )
+        self.runner.responses["adb -s test_device shell pm list packages"] = CommandResult(
+            0, installed, ""
+        )
+        self.runner.responses[
+            "adb -s test_device shell settings get secure enabled_notification_listeners"
+        ] = CommandResult(
+            0, "com.example.notifications/.NotificationListener", ""
+        )
+        self.runner.responses[
+            "adb -s test_device shell cmd package query-services --brief -a android.content.SyncAdapter"
+        ] = CommandResult(
+            0, "com.example.mail/.MailSyncAdapterService", ""
+        )
+        self.runner.responses[
+            "adb -s test_device shell cmd companiondevice list 0"
+        ] = CommandResult(
+            0,
+            "Association ID | Package Name | Mac Address\n"
+            "1 | com.example.wearable | 00:11:22:33:44:55",
+            "",
+        )
+
+        protected = self.app._get_protected_packages()
+
+        self.assertEqual(protected["com.example.notifications"], "notification_listener")
+        self.assertEqual(protected["com.example.mail"], "account_sync")
+        self.assertEqual(protected["com.example.wearable"], "companion_device")
+
+    def test_smart_restrict_reports_specific_protection_reason(self):
+        self.runner.responses[
+            "adb -s test_device shell settings get secure enabled_notification_listeners"
+        ] = CommandResult(
+            0, "com.example.app/.NotificationListener", ""
+        )
+
+        result = self.app.smart_restrict(aggressive=True)
+
+        skipped = {
+            item["package"]: item["reason"] for item in result["skipped"]
+        }
+        self.assertEqual(
+            skipped["com.example.app"],
+            "protected:notification_listener",
+        )
 
     def test_balanced_mode(self):
         self.app.smart_restrict(aggressive=False)

@@ -1,10 +1,13 @@
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from .adb import AdbClient, CommandError
+from .android import parse_builtin_refresh_rates
 from .recorder import StateRecorder
 from .state import StateStore
+from .verification import VerificationError
 
 WHITELIST_FILE = "whitelist.txt"
 
@@ -297,6 +300,36 @@ class BatteryOptimizerApp:
                 for key, value in values.items():
                     self.recorder.put_setting(namespace, key, value)
 
+    def _display_supports_120hz(self) -> bool:
+        try:
+            output = self.client.shell_text(
+                ["dumpsys", "display"],
+                check=True,
+                timeout=self.client.LONG_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return False
+        return any(rate >= 119.0 for rate in parse_builtin_refresh_rates(output))
+
+    def apply_120hz_endurance_profile(self) -> None:
+        if not self._display_supports_120hz():
+            raise ValueError(
+                "The built-in display does not report 120 Hz support. "
+                "Endurance profile aborted."
+            )
+
+        self.apply_experimental_optimizations()
+
+        if self.client.dry_run or self._display_supports_120hz():
+            return
+
+        restore_messages = self.revert_saved_state()
+        details = "; ".join(restore_messages) if restore_messages else "state restored"
+        raise VerificationError(
+            "120 Hz support disappeared after applying the endurance profile; "
+            f"rolled back changes ({details})."
+        )
+
     def restrict_background_apps(self, level: str = "ignore") -> Dict[str, List[str]]:
         if not self.client.supports_appops():
             raise ValueError("Device does not support `appops` command via `cmd`. Background restriction aborted.")
@@ -347,22 +380,59 @@ class BatteryOptimizerApp:
         from .diagnose import Diagnoser
         return Diagnoser(self.client).run(third_party_only=third_party_only)
 
-    def _get_critical_packages(self) -> Set[str]:
-        critical = set()
-        # Common prefixes
+    def _get_protected_packages(self) -> Dict[str, str]:
+        protected: Dict[str, str] = {}
         installed = self.get_installed_packages_set()
+
+        def add(package: str, reason: str) -> None:
+            package = package.strip()
+            if package in installed and package != "android":
+                protected[package] = reason
+
+        def add_components(output: str, reason: str) -> None:
+            component_pattern = r"([a-zA-Z0-9_.]+)/[a-zA-Z0-9_.$]+"
+            for package in re.findall(component_pattern, output):
+                add(package, reason)
+
         for pkg in installed:
             if pkg.startswith(("com.android.", "com.google.android.", "android")):
-                critical.add(pkg)
+                protected[pkg] = "system"
 
         commands = {
-            "launcher": ["cmd", "package", "resolve-activity", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.HOME"],
+            "launcher": [
+                "cmd", "package", "resolve-activity", "-a",
+                "android.intent.action.MAIN", "-c",
+                "android.intent.category.HOME",
+            ],
             "dialer": ["telecom", "get-default-dialer"],
             "sms": ["settings", "get", "secure", "sms_default_application"],
             "ime": ["settings", "get", "secure", "default_input_method"],
             "a11y": ["settings", "get", "secure", "enabled_accessibility_services"],
             "vpn": ["settings", "get", "secure", "always_on_vpn_app"],
-            "companion": ["cmd", "companiondevice", "list"],
+            "notification_listener": [
+                "settings", "get", "secure",
+                "enabled_notification_listeners",
+            ],
+            "account_sync": [
+                "cmd", "package", "query-services", "--brief", "-a",
+                "android.content.SyncAdapter",
+            ],
+            "email": [
+                "cmd", "package", "resolve-activity", "--brief", "-a",
+                "android.intent.action.SENDTO", "-d",
+                "mailto:battery@example.com",
+            ],
+            "navigation": [
+                "cmd", "package", "resolve-activity", "--brief", "-a",
+                "android.intent.action.VIEW", "-d", "geo:0,0?q=battery",
+            ],
+            "media": [
+                "cmd", "package", "resolve-activity", "--brief", "-a",
+                "android.intent.action.VIEW", "-d",
+                "content://media/external/audio/media/1", "-t", "audio/mpeg",
+            ],
+            "companion_device": ["cmd", "companiondevice", "list", "0"],
+            "active_media": ["dumpsys", "media_session"],
         }
 
         for name, cmd in commands.items():
@@ -372,23 +442,34 @@ class BatteryOptimizerApp:
                     if name == "launcher" and "packageName=" in out:
                         for line in out.splitlines():
                             if "packageName=" in line:
-                                critical.add(line.split("=")[1].strip())
-                    elif name == "ime":
-                        critical.add(out.split("/")[0])
-                    elif name == "a11y":
-                        for service in out.split(":"):
-                            if service:
-                                critical.add(service.split("/")[0])
-                    elif name == "companion":
+                                add(line.split("=")[1].strip(), "launcher")
+                    elif name in {
+                        "ime",
+                        "a11y",
+                        "notification_listener",
+                        "account_sync",
+                        "email",
+                        "navigation",
+                        "media",
+                    }:
+                        add_components(out, name)
+                    elif name == "companion_device":
                         for line in out.splitlines():
-                            if "Package:" in line:
-                                critical.add(line.split("Package:")[1].strip())
+                            columns = [column.strip() for column in line.split("|")]
+                            if len(columns) >= 2 and columns[0].isdigit():
+                                add(columns[1], name)
+                    elif name == "active_media":
+                        for package in re.findall(r"package=([a-zA-Z0-9_.]+)", out):
+                            add(package, "media")
                     else:
-                        critical.add(out.strip())
+                        add(out.strip(), name)
             except Exception:
                 pass
 
-        return critical
+        return protected
+
+    def _get_critical_packages(self) -> Set[str]:
+        return set(self._get_protected_packages())
 
     def smart_restrict(
         self,
@@ -403,7 +484,7 @@ class BatteryOptimizerApp:
             raise ValueError("Device does not support `am set-standby-bucket`.")
 
         whitelist = set(self.load_whitelist())
-        critical = self._get_critical_packages()
+        protected = self._get_protected_packages()
 
         applied = []
         skipped = []
@@ -447,8 +528,13 @@ class BatteryOptimizerApp:
                 if pkg in whitelist:
                     skipped.append({"package": pkg, "reason": "whitelisted"})
                     continue
-                if pkg in critical:
-                    skipped.append({"package": pkg, "reason": "critical"})
+                if pkg in protected:
+                    skipped.append(
+                        {
+                            "package": pkg,
+                            "reason": f"protected:{protected[pkg]}",
+                        }
+                    )
                     continue
 
                 if min_last_used_days is not None:
