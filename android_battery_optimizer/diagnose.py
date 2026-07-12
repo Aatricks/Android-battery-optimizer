@@ -130,10 +130,27 @@ def parse_wakelock_ms(output: str) -> Dict[str, int]:
             pkg = fields[5]
             uid_to_pkgs.setdefault(uid, set()).add(pkg)
 
+    aggregated_uids = set()
+    for fields in lines:
+        if len(fields) < 5 or fields[3] != "awl":
+            continue
+        uid = fields[1]
+        packages = uid_to_pkgs.get(uid, set())
+        if len(packages) != 1:
+            continue
+        try:
+            partial_ms = int(fields[4])
+        except ValueError:
+            continue
+        pkg_wakelocks[next(iter(packages))] = partial_ms
+        aggregated_uids.add(uid)
+
     # Second pass: sum partial wakelock times
     for fields in lines:
         if len(fields) >= 4 and fields[3] == "wl":
             uid = fields[1]
+            if uid in aggregated_uids:
+                continue
             if uid in uid_to_pkgs and len(uid_to_pkgs[uid]) == 1:
                 try:
                     p_idx = fields.index("p")

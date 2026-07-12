@@ -431,6 +431,10 @@ class BatteryOptimizerApp:
                 "android.intent.action.VIEW", "-d",
                 "content://media/external/audio/media/1", "-t", "audio/mpeg",
             ],
+            "music_player": [
+                "cmd", "package", "query-activities", "--brief", "-a",
+                "android.intent.action.MUSIC_PLAYER",
+            ],
             "companion_device": ["cmd", "companiondevice", "list", "0"],
             "active_media": ["dumpsys", "media_session"],
         }
@@ -451,8 +455,10 @@ class BatteryOptimizerApp:
                         "email",
                         "navigation",
                         "media",
+                        "music_player",
                     }:
-                        add_components(out, name)
+                        reason = "media" if name == "music_player" else name
+                        add_components(out, reason)
                     elif name == "companion_device":
                         for line in out.splitlines():
                             columns = [column.strip() for column in line.split("|")]

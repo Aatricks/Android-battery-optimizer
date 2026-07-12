@@ -138,6 +138,18 @@ class TestDiagnose(unittest.TestCase):
 
         self.assertEqual(parse_wakelock_ms(output), {})
 
+    def test_aggregated_wakelock_milliseconds_take_precedence(self):
+        output = (
+            "9,0,i,uid,10337,com.spotify.music\n"
+            "9,10337,l,awl,4031305,3882471\n"
+            "9,10337,l,wl,AudioMix,0,f,0,0,0,0,2268283,p,1\n"
+        )
+
+        self.assertEqual(
+            parse_wakelock_ms(output),
+            {"com.spotify.music": 4031305},
+        )
+
     def test_duration_parser_accepts_multi_day_windows(self):
         self.assertEqual(
             parse_duration_ms("1d 2h 3m 4s 5ms"),

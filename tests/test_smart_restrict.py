@@ -176,6 +176,27 @@ class TestSmartRestrict(unittest.TestCase):
             "protected:notification_listener",
         )
 
+    def test_protects_declared_music_player(self):
+        installed = (
+            "package:com.example.app\n"
+            "package:com.spotify.music"
+        )
+        self.runner.responses["adb -s test_device shell pm list packages"] = CommandResult(
+            0, installed, ""
+        )
+        self.runner.responses[
+            "adb -s test_device shell cmd package query-activities --brief -a android.intent.action.MUSIC_PLAYER"
+        ] = CommandResult(
+            0,
+            "1 activities found:\n"
+            "  com.spotify.music/.SpotifyMainActivity",
+            "",
+        )
+
+        protected = self.app._get_protected_packages()
+
+        self.assertEqual(protected["com.spotify.music"], "media")
+
     def test_balanced_mode(self):
         self.app.smart_restrict(aggressive=False)
         
