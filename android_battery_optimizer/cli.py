@@ -321,6 +321,34 @@ class BatteryOptimizerCLI:
                     for w in report["warnings"]:
                         self.output(f"  {w}")
 
+                system = report.get("system", {})
+                obs_ms = system.get("observation_ms")
+                soff_ms = system.get("screen_off_ms")
+                son_drain = system.get("screen_on_drain_percent")
+                soff_drain = system.get("screen_off_drain_percent")
+
+                def format_hours(ms):
+                    if ms is None:
+                        return "unavailable"
+                    try:
+                        return f"{ms / 3600000.0:.2f} hours"
+                    except (TypeError, ValueError):
+                        return "unavailable"
+
+                def format_percent(val):
+                    if val is None:
+                        return "unavailable"
+                    try:
+                        return f"{val}%"
+                    except (TypeError, ValueError):
+                        return "unavailable"
+
+                self.output("\nBattery Summary:")
+                self.output(f"  Observation duration: {format_hours(obs_ms)}")
+                self.output(f"  Screen-off duration: {format_hours(soff_ms)}")
+                self.output(f"  Screen-on drain: {format_percent(son_drain)}")
+                self.output(f"  Screen-off drain: {format_percent(soff_drain)}")
+
                 self.output("\nDiagnosis Summary:")
                 for pkg in report["packages"]:
                     self.output(

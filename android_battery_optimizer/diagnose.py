@@ -166,6 +166,35 @@ def parse_wakelock_ms(output: str) -> Dict[str, int]:
     return pkg_wakelocks
 
 
+def parse_fgs_ms(output: str) -> Dict[str, int]:
+    pkg_fgs = {}
+    if not output:
+        return pkg_fgs
+
+    rows = list(csv.reader(output.splitlines()))
+    uid_to_pkgs: Dict[str, set[str]] = {}
+    for fields in rows:
+        if len(fields) >= 6 and fields[3] == "uid":
+            uid_to_pkgs.setdefault(fields[4], set()).add(fields[5])
+
+    checkin_rows = [
+        fields for fields in rows if len(fields) >= 6 and fields[3] == "fgs"
+    ]
+    for fields in checkin_rows:
+        uid = fields[1]
+        packages = uid_to_pkgs.get(uid, set())
+        if len(packages) != 1:
+            continue
+        try:
+            fgs_ms = int(fields[4])
+        except ValueError:
+            continue
+        package = next(iter(packages))
+        pkg_fgs[package] = pkg_fgs.get(package, 0) + fgs_ms
+
+    return pkg_fgs
+
+
 def parse_registered_jobs(
     output: str, pkg: str, has_package_signal_fn
 ) -> int:
@@ -238,6 +267,11 @@ class Diagnoser:
             if dumpsys_outputs["batterystats"]
             else None
         )
+        fgs_map = (
+            parse_fgs_ms(dumpsys_outputs["batterystats"])
+            if dumpsys_outputs["batterystats"]
+            else None
+        )
         system_summary = parse_battery_summary(
             dumpsys_outputs["batterystats_charged"]
         )
@@ -260,6 +294,9 @@ class Diagnoser:
             wakelock_partial_ms = (
                 wakelock_map.get(pkg, 0) if wakelock_map is not None else None
             )
+            foreground_service_ms = (
+                fgs_map.get(pkg, 0) if fgs_map is not None else None
+            )
             jobs_registered = (
                 parse_registered_jobs(
                     dumpsys_outputs["jobscheduler"],
@@ -278,6 +315,7 @@ class Diagnoser:
             signals = {
                 "alarm_wakeups": alarm_wakeups,
                 "wakelock_partial_ms": wakelock_partial_ms,
+                "foreground_service_ms": foreground_service_ms,
                 "jobs_registered": jobs_registered,
                 "last_used": last_used,
                 "observation_ms": system_summary["observation_ms"],
@@ -413,18 +451,18 @@ class Diagnoser:
         w_wake = wakelock_ms if wakelock_ms is not None else 0
         w_jobs = jobs if jobs is not None else 0
 
+        rec = "keep"
+        reasons = []
         if w_alarm >= 1000 or w_wake >= 3600000:
-            reasons = []
+            rec = "aggressive_restrict"
             if w_alarm >= 1000:
                 reasons.append(f"{w_alarm} alarm wakeups since charge")
             if w_wake >= 3600000:
                 reasons.append(
                     f"{w_wake} ms partial wakelock time since charge"
                 )
-            return "aggressive_restrict", ", ".join(reasons)
-
-        if w_alarm >= 100 or w_wake >= 600000 or w_jobs >= 100:
-            reasons = []
+        elif w_alarm >= 100 or w_wake >= 600000 or w_jobs >= 100:
+            rec = "restrict"
             if w_alarm >= 100:
                 reasons.append(f"{w_alarm} alarm wakeups since charge")
             if w_wake >= 600000:
@@ -433,6 +471,18 @@ class Diagnoser:
                 )
             if w_jobs >= 100:
                 reasons.append(f"{w_jobs} registered jobs")
-            return "restrict", ", ".join(reasons)
+        else:
+            return "keep", "Minimal background activity detected"
 
-        return "keep", "Minimal background activity detected"
+        fgs_ms = signals.get("foreground_service_ms")
+        w_fgs = fgs_ms if fgs_ms is not None else 0
+        if w_fgs >= 600000:
+            original_reason = ", ".join(reasons)
+            reason = (
+                f"High foreground service usage ({w_fgs} ms), "
+                "manual review recommended. "
+                f"Original reasons: {original_reason}"
+            )
+            return "review", reason
+
+        return rec, ", ".join(reasons)

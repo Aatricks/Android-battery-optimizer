@@ -565,7 +565,7 @@ class BatteryOptimizerApp:
                 rec = pkg_info["recommendation"]
                 reason = pkg_info.get("reason", "")
 
-                if rec == "keep":
+                if rec in ("keep", "review"):
                     kept.append({"package": pkg, "reason": reason})
                     continue
 
