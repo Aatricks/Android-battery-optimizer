@@ -1,0 +1,1440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Android Battery Optimizer</title>
+    <style>
+        :root {
+            --background: #ffffff;
+            --foreground: #09090b;
+            --card: #ffffff;
+            --border: #e4e4e7;
+            --input: #e4e4e7;
+            --muted: #f4f4f5;
+            --muted-foreground: #71717a;
+            --primary: #18181b;
+            --primary-foreground: #fafafa;
+            --ring: rgba(24, 24, 27, 0.12);
+            --success: #16a34a;
+            --success-bg: #f0fdf4;
+            --warning: #a16207;
+            --warning-bg: #fefce8;
+            --danger: #dc2626;
+            --danger-bg: #fef2f2;
+            --radius: 8px;
+            --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+            --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --background: #09090b;
+                --foreground: #fafafa;
+                --card: #09090b;
+                --border: #27272a;
+                --input: #27272a;
+                --muted: #18181b;
+                --muted-foreground: #a1a1aa;
+                --primary: #fafafa;
+                --primary-foreground: #18181b;
+                --ring: rgba(250, 250, 250, 0.16);
+                --success: #4ade80;
+                --success-bg: rgba(74, 222, 128, 0.08);
+                --warning: #fbbf24;
+                --warning-bg: rgba(251, 191, 36, 0.08);
+                --danger: #f87171;
+                --danger-bg: rgba(248, 113, 113, 0.08);
+            }
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background-color: var(--background);
+            color: var(--foreground);
+            min-height: 100vh;
+            padding: 2.5rem 1.25rem;
+            font-size: 0.875rem;
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 1080px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 1rem;
+            padding-bottom: 1.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+
+        .header-sub {
+            display: block;
+            font-size: 0.8125rem;
+            font-weight: 400;
+            color: var(--muted-foreground);
+            letter-spacing: 0;
+            margin-top: 0.125rem;
+        }
+
+        #loading-indicator {
+            font-size: 0.8125rem;
+            color: var(--muted-foreground);
+            display: none;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        /* Card */
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 1.5rem;
+        }
+
+        .card-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        /* Grid Layout */
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.25rem;
+        }
+
+        @media (min-width: 768px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        /* Badges */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.125rem 0.625rem;
+            border-radius: 9999px;
+            border: 1px solid var(--border);
+            font-size: 0.6875rem;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--muted-foreground);
+            white-space: nowrap;
+        }
+
+        .badge-dry {
+            color: var(--warning);
+            border-color: currentColor;
+            background: var(--warning-bg);
+        }
+
+        .badge-rollback {
+            color: var(--success);
+            border-color: currentColor;
+            background: var(--success-bg);
+        }
+
+        .badge-no-rollback {
+            color: var(--muted-foreground);
+        }
+
+        /* Device Info */
+        .device-info-content {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2rem;
+            align-items: center;
+        }
+
+        .battery-gauge-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            min-width: 130px;
+        }
+
+        #battery-percent-label {
+            font-size: 1.5rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            line-height: 1;
+        }
+
+        .battery-meter {
+            width: 100%;
+            height: 6px;
+            background: var(--muted);
+            border-radius: 9999px;
+            overflow: hidden;
+        }
+
+        .battery-level-bar {
+            height: 100%;
+            border-radius: 9999px;
+            background-color: var(--success);
+            width: 0%;
+            transition: width 0.4s ease;
+        }
+
+        .device-meta-list {
+            display: grid;
+            grid-template-columns: auto auto;
+            gap: 0.25rem 1.5rem;
+            font-size: 0.8125rem;
+        }
+
+        .device-meta-label {
+            color: var(--muted-foreground);
+        }
+
+        .device-meta-value {
+            font-weight: 500;
+        }
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            height: 2.25rem;
+            padding: 0 1rem;
+            border-radius: 6px;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            font-family: inherit;
+            cursor: pointer;
+            border: 1px solid transparent;
+            background: none;
+            color: inherit;
+            gap: 0.5rem;
+            white-space: nowrap;
+            transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+        }
+
+        .btn:active:not(:disabled) {
+            transform: scale(0.98);
+        }
+
+        .btn-primary {
+            background-color: var(--primary);
+            color: var(--primary-foreground);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            opacity: 0.9;
+        }
+
+        .btn-secondary {
+            border-color: var(--border);
+            background-color: var(--card);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background-color: var(--muted);
+        }
+
+        .btn-danger {
+            border-color: var(--border);
+            color: var(--danger);
+            background-color: var(--card);
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background-color: var(--danger-bg);
+            border-color: var(--danger);
+        }
+
+        .btn-xs {
+            height: 1.625rem;
+            padding: 0 0.625rem;
+            font-size: 0.75rem;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Actions Grid */
+        .actions-card-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 0.75rem;
+        }
+
+        @media (min-width: 480px) {
+            .actions-card-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
+        .action-row {
+            display: flex;
+            flex-direction: column;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1rem;
+        }
+
+        .action-span {
+            grid-column: 1 / -1;
+        }
+
+        .action-row-title {
+            font-size: 0.8125rem;
+            font-weight: 600;
+        }
+
+        .action-row-desc {
+            font-size: 0.75rem;
+            color: var(--muted-foreground);
+            margin-bottom: 0.75rem;
+        }
+
+        .action-row .btn {
+            align-self: flex-start;
+            margin-top: auto;
+        }
+
+        /* Forms */
+        .form-row {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        label {
+            font-size: 0.8125rem;
+            color: var(--muted-foreground);
+        }
+
+        input[type="text"], input[type="number"], select {
+            height: 2.25rem;
+            background-color: transparent;
+            border: 1px solid var(--input);
+            border-radius: 6px;
+            padding: 0 0.75rem;
+            color: var(--foreground);
+            font-size: 0.8125rem;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        input[type="text"]:focus, input[type="number"]:focus, select:focus {
+            border-color: var(--muted-foreground);
+            box-shadow: 0 0 0 3px var(--ring);
+        }
+
+        select {
+            background-color: var(--card);
+        }
+
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .toggle-switch {
+            width: 2.25rem;
+            height: 1.25rem;
+            background-color: var(--input);
+            border-radius: 9999px;
+            position: relative;
+            flex-shrink: 0;
+            transition: background-color 0.15s ease;
+        }
+
+        .toggle-switch::after {
+            content: '';
+            position: absolute;
+            left: 2px;
+            top: 2px;
+            width: 1rem;
+            height: 1rem;
+            background-color: var(--background);
+            border-radius: 50%;
+            transition: transform 0.15s ease;
+        }
+
+        .toggle-container input[type="checkbox"] {
+            display: none;
+        }
+
+        .toggle-container input[type="checkbox"]:checked + .toggle-switch {
+            background-color: var(--primary);
+        }
+
+        .toggle-container input[type="checkbox"]:checked + .toggle-switch::after {
+            transform: translateX(1rem);
+        }
+
+        details.customize {
+            margin-bottom: 0.75rem;
+        }
+
+        details.customize summary {
+            font-size: 0.75rem;
+            color: var(--muted-foreground);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .feature-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.8125rem;
+            padding: 0.1875rem 0;
+            cursor: pointer;
+        }
+
+        .feature-item input[type="checkbox"] {
+            accent-color: var(--primary);
+            margin: 0;
+        }
+
+        .feature-list {
+            margin-top: 0.5rem;
+        }
+
+        /* Tables */
+        .table-container {
+            overflow-x: auto;
+            margin-top: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8125rem;
+            text-align: left;
+        }
+
+        th, td {
+            padding: 0.625rem 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background-color: var(--card);
+            font-weight: 500;
+            font-size: 0.75rem;
+            color: var(--muted-foreground);
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tbody tr:hover td {
+            background-color: var(--muted);
+        }
+
+        .cell-muted {
+            color: var(--muted-foreground);
+        }
+
+        .cell-danger {
+            color: var(--danger);
+        }
+
+        .cell-success {
+            color: var(--success);
+        }
+
+        /* Chips */
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.0625rem 0.5rem;
+            border-radius: 9999px;
+            font-size: 0.6875rem;
+            font-weight: 500;
+            border: 1px solid transparent;
+        }
+
+        .chip-keep {
+            background-color: var(--success-bg);
+            color: var(--success);
+        }
+
+        .chip-review {
+            background-color: var(--warning-bg);
+            color: var(--warning);
+        }
+
+        .chip-restrict {
+            background-color: var(--danger-bg);
+            color: var(--danger);
+        }
+
+        /* Search Filter Row */
+        .filter-row {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 0.25rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .search-input {
+            flex: 1;
+            min-width: 200px;
+        }
+
+        /* Log Panel */
+        .log-panel-header {
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+
+        #log-toggle-icon {
+            color: var(--muted-foreground);
+            font-weight: 400;
+        }
+
+        .log-panel-content {
+            display: none;
+            margin-top: 1rem;
+            background-color: var(--muted);
+            border-radius: 6px;
+            padding: 0.875rem 1rem;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            line-height: 1.7;
+            max-height: 250px;
+            overflow-y: auto;
+            color: var(--muted-foreground);
+            white-space: pre-wrap;
+        }
+
+        .log-line-err {
+            color: var(--danger);
+        }
+
+        .log-line-warn {
+            color: var(--warning);
+        }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s ease;
+            padding: 1rem;
+        }
+
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .modal-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            width: 100%;
+            max-width: 26rem;
+            padding: 1.5rem;
+        }
+
+        .modal-header {
+            font-size: 1rem;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+            margin-bottom: 0.5rem;
+        }
+
+        .modal-body {
+            font-size: 0.8125rem;
+            color: var(--muted-foreground);
+            margin-bottom: 1.25rem;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.5rem;
+        }
+
+        /* Spinner */
+        .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--border);
+            border-top-color: var(--foreground);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Whitelist */
+        .whitelist-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .whitelist-list {
+            display: flex;
+            flex-direction: column;
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+
+        .whitelist-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.8125rem;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .whitelist-item:last-child {
+            border-bottom: none;
+        }
+
+        .whitelist-empty {
+            color: var(--muted-foreground);
+            padding: 0.75rem;
+            font-size: 0.8125rem;
+        }
+
+        .picker-container {
+            position: relative;
+        }
+
+        .picker-dropdown {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            max-height: 180px;
+            overflow-y: auto;
+            z-index: 10;
+            display: none;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+        }
+
+        .picker-option {
+            padding: 0.5rem 0.75rem;
+            cursor: pointer;
+            font-size: 0.8125rem;
+        }
+
+        .picker-option:hover {
+            background-color: var(--muted);
+        }
+
+        .card-note {
+            font-size: 0.75rem;
+            color: var(--muted-foreground);
+            margin: -0.5rem 0 1rem;
+        }
+
+        .status-line {
+            display: none;
+            font-size: 0.8125rem;
+            color: var(--success);
+            margin-top: 0.75rem;
+        }
+
+        .action-row-title .chip {
+            margin-left: 0.375rem;
+            vertical-align: 1px;
+        }
+
+        .card-divider {
+            margin-top: 1rem;
+            border-top: 1px solid var(--border);
+            padding-top: 1rem;
+            display: flex;
+            justify-content: flex-end;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>Android Battery Optimizer</h1>
+                <span class="header-sub">Local dashboard for the connected device</span>
+            </div>
+            <div id="loading-indicator">
+                <span class="spinner"></span> Working
+            </div>
+        </header>
+
+        <!-- Device Info Header Card -->
+        <div class="card">
+            <div class="card-title">
+                Device Status
+                <div style="display: flex; gap: 0.5rem;">
+                    <span id="dry-run-badge" class="badge badge-dry" style="display: none;">Dry run</span>
+                    <span id="rollback-badge" class="badge"></span>
+                </div>
+            </div>
+            <div class="device-info-content">
+                <div class="battery-gauge-wrapper">
+                    <span id="battery-percent-label">--%</span>
+                    <div class="battery-meter">
+                        <div id="battery-bar" class="battery-level-bar"></div>
+                    </div>
+                </div>
+                <div class="device-meta-list">
+                    <div class="device-meta-label">Device</div>
+                    <div id="meta-device" class="device-meta-value">Connecting...</div>
+
+                    <div class="device-meta-label">Serial</div>
+                    <div id="meta-serial" class="device-meta-value">--</div>
+
+                    <div class="device-meta-label">Health</div>
+                    <div id="meta-health" class="device-meta-value">--</div>
+
+                    <div class="device-meta-label">Temperature</div>
+                    <div id="meta-temp" class="device-meta-value">--</div>
+                </div>
+                <div style="margin-left: auto;">
+                    <button class="btn btn-secondary" onclick="refreshStatus()">Refresh</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="dashboard-grid">
+            <!-- Optimizations Card -->
+            <div class="card">
+                <div class="card-title">Optimizations</div>
+                <div class="actions-card-grid">
+                    <div class="action-row">
+                        <div class="action-row-title">Documented Safe Profile</div>
+                        <div class="action-row-desc">Two documented AOSP flags that auto-restrict apps the system flags as background-abusive.</div>
+                        <button class="btn btn-primary" onclick="applySafe()">Apply</button>
+                    </div>
+                    <div class="action-row">
+                        <div class="action-row-title">Experimental Profile <span class="chip chip-review">experimental</span></div>
+                        <div class="action-row-desc">Tunes Doze timers so the phone idles sooner and sleeps deeper. Changes system settings.</div>
+                        <button class="btn btn-secondary" onclick="applyExperimental()">Apply</button>
+                    </div>
+                    <div class="action-row">
+                        <div class="action-row-title">Samsung Experimental <span class="chip chip-review">experimental</span></div>
+                        <div class="action-row-desc" id="samsung-desc">Turns off One UI extras: motion gestures, always-on display, nearby scanning.</div>
+                        <details class="customize" id="samsung-customize">
+                            <summary>Customize features</summary>
+                            <div class="feature-list" id="samsung-features"></div>
+                        </details>
+                        <button class="btn btn-secondary" id="samsung-btn" onclick="applySamsung()">Apply</button>
+                    </div>
+                    <div class="action-row">
+                        <div class="action-row-title">120 Hz Endurance <span class="chip chip-review">experimental</span></div>
+                        <div class="action-row-desc">Applies the experimental profile, verifies 120 Hz is still active, and rolls back if it is not.</div>
+                        <button class="btn btn-secondary" onclick="apply120Hz()">Apply</button>
+                    </div>
+                    <div class="action-row action-span">
+                        <div class="action-row-title">Restrict All Third-Party Apps</div>
+                        <div class="action-row-desc">Set the background policy for every user-installed app outside the whitelist. You will see the affected count before anything is applied.</div>
+                        <div class="form-row">
+                            <select id="restrict-apps-level">
+                                <option value="ignore">Restrict background use</option>
+                                <option value="allow">Allow background use</option>
+                            </select>
+                            <button class="btn btn-danger" onclick="applyRestrictApps()">Preview and apply</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="status-line" id="opt-status"></div>
+                <div class="card-divider">
+                    <button class="btn btn-danger" id="revert-btn" onclick="applyRevert()">Revert Saved State</button>
+                </div>
+            </div>
+
+            <!-- Whitelist Card -->
+            <div class="card">
+                <div class="card-title">App Whitelist</div>
+                <div class="card-note">Whitelisted apps are never touched by Restrict All or Smart Restrict.</div>
+                <div class="whitelist-grid">
+                    <div class="whitelist-list" id="whitelist-box">
+                        <div class="whitelist-empty">Loading whitelist...</div>
+                    </div>
+                    <div class="picker-container">
+                        <input type="text" id="whitelist-search-input" placeholder="Search installed apps to add..." style="width: 100%;" onfocus="showPicker()" oninput="filterPicker()">
+                        <div class="picker-dropdown" id="picker-drop"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Diagnose Card -->
+            <div class="card full-width">
+                <div class="card-title">
+                    Diagnostics
+                    <button class="btn btn-primary" onclick="runDiagnose()">Run Diagnostics</button>
+                </div>
+                <div class="filter-row">
+                    <input type="text" id="diag-search" placeholder="Filter by package..." class="search-input" oninput="filterDiagTable()">
+                    <select id="diag-filter-rec" onchange="filterDiagTable()">
+                        <option value="ALL">All recommendations</option>
+                        <option value="keep">Keep</option>
+                        <option value="review">Review</option>
+                        <option value="restrict">Restrict / aggressive</option>
+                    </select>
+                    <label class="toggle-container">
+                        <input type="checkbox" id="diag-all-apps" onchange="runDiagnose()">
+                        <span class="toggle-switch"></span>
+                        Include system packages
+                    </label>
+                </div>
+                <div class="table-container">
+                    <table id="diag-table">
+                        <thead>
+                            <tr>
+                                <th onclick="sortDiagTable(0)">Package</th>
+                                <th onclick="sortDiagTable(1)">Bucket</th>
+                                <th onclick="sortDiagTable(2)">Recommendation</th>
+                                <th onclick="sortDiagTable(3)">Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="diag-tbody">
+                            <tr>
+                                <td colspan="4" class="cell-muted" style="text-align: center;">No diagnostic data loaded. Click Run Diagnostics.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Smart Restrict Card -->
+            <div class="card full-width">
+                <div class="card-title">Smart Restrict</div>
+                <div class="form-row" style="margin-bottom: 1.25rem;">
+                    <label class="toggle-container">
+                        <input type="checkbox" id="sr-aggressive">
+                        <span class="toggle-switch"></span>
+                        Aggressive mode
+                    </label>
+                    <div class="form-row" style="gap: 0.5rem;">
+                        <label for="sr-days">Min days unused</label>
+                        <input type="number" id="sr-days" min="0" value="7" style="width: 5rem;">
+                    </div>
+                    <button class="btn btn-primary" onclick="previewSmartRestrict()">Preview</button>
+                    <button class="btn btn-danger" id="sr-apply-btn" data-locked="1" disabled title="Run a preview first" onclick="applySmartRestrict()">Apply</button>
+                </div>
+                <div class="status-line" id="sr-status" style="margin: -0.5rem 0 0.75rem;"></div>
+                <div id="sr-preview-summary" style="margin-bottom: 0.75rem; font-size: 0.8125rem; font-weight: 500; display: none;"></div>
+                <div class="table-container" id="sr-preview-container" style="display: none; margin-top: 0;">
+                    <table id="sr-table">
+                        <thead>
+                            <tr>
+                                <th>Package</th>
+                                <th>Action</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sr-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Log Panel -->
+            <div class="card full-width">
+                <div class="log-panel-header" onclick="toggleLogs()">
+                    <span>Activity Log</span>
+                    <span id="log-toggle-icon">+</span>
+                </div>
+                <div class="log-panel-content" id="log-content">No commands run in this session yet.</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Modal -->
+    <div class="modal-overlay" id="confirm-modal">
+        <div class="modal-card">
+            <div class="modal-header" id="modal-title">Confirm Operation</div>
+            <div class="modal-body" id="modal-message">This action may affect system behavior. Continue?</div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="modalCallback(false)">Cancel</button>
+                <button class="btn btn-primary" onclick="modalCallback(true)">Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const token = new URLSearchParams(window.location.search).get('token') || '';
+        let isBusy = false;
+        let installedPackages = [];
+        let diagData = [];
+        let sortDirections = [1, 1, 1, 1];
+
+        const BUCKET_NAMES = {5: 'exempted', 10: 'active', 20: 'working set', 30: 'frequent', 40: 'rare', 45: 'restricted', 50: 'never'};
+        function bucketName(bucket) {
+            if (bucket === null || bucket === undefined || bucket === '') return 'unknown';
+            return BUCKET_NAMES[Number(bucket)] || String(bucket);
+        }
+
+        function showStatus(elementId, text) {
+            const el = document.getElementById(elementId);
+            el.innerText = text;
+            el.style.display = 'block';
+        }
+
+        // API Caller
+        async function apiCall(method, path, body = null) {
+            if (isBusy) return null;
+            setBusy(true);
+            try {
+                const response = await fetch(path, {
+                    method: method,
+                    headers: {
+                        'X-ABO-Token': token,
+                        'Content-Type': 'application/json'
+                    },
+                    body: body ? JSON.stringify(body) : null
+                });
+
+                const data = await response.json();
+
+                // Append logs
+                if (data.messages && data.messages.length > 0) {
+                    appendLogs(data.messages);
+                }
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Request failed');
+                }
+
+                return data;
+            } catch (err) {
+                appendLogs([`[Error] ${err.message}`], true);
+                alert(`Error: ${err.message}`);
+                return null;
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        function setBusy(busy) {
+            isBusy = busy;
+            document.getElementById('loading-indicator').style.display = busy ? 'inline-flex' : 'none';
+            document.querySelectorAll('button').forEach(btn => btn.disabled = busy || btn.dataset.locked === '1');
+        }
+
+        // Log Panel
+        function appendLogs(lines, isErr = false) {
+            const container = document.getElementById('log-content');
+            if (container.innerText === 'No commands run in this session yet.') {
+                container.innerHTML = '';
+            }
+            lines.forEach(line => {
+                const div = document.createElement('div');
+                div.className = isErr ? 'log-line-err' : (line.includes('Warning') ? 'log-line-warn' : '');
+                div.innerText = line;
+                container.appendChild(div);
+            });
+            container.scrollTop = container.scrollHeight;
+            container.style.display = 'block';
+            document.getElementById('log-toggle-icon').innerText = '-';
+        }
+
+        function toggleLogs() {
+            const container = document.getElementById('log-content');
+            const icon = document.getElementById('log-toggle-icon');
+            if (container.style.display === 'none' || !container.style.display) {
+                container.style.display = 'block';
+                icon.innerText = '-';
+            } else {
+                container.style.display = 'none';
+                icon.innerText = '+';
+            }
+        }
+
+        // Custom Confirm Promise
+        let modalResolve = null;
+        function confirmModal(title, msg) {
+            document.getElementById('modal-title').innerText = title;
+            document.getElementById('modal-message').innerText = msg;
+            document.getElementById('confirm-modal').classList.add('active');
+            return new Promise((resolve) => {
+                modalResolve = resolve;
+            });
+        }
+
+        function modalCallback(confirmed) {
+            document.getElementById('confirm-modal').classList.remove('active');
+            if (modalResolve) {
+                modalResolve(confirmed);
+                modalResolve = null;
+            }
+        }
+
+        // Refresh Status
+        async function refreshStatus() {
+            const data = await apiCall('GET', '/api/status');
+            if (!data) return;
+            const res = data.result;
+
+            // Render Battery Bar
+            const level = res.battery_status.level || 0;
+            const bar = document.getElementById('battery-bar');
+            bar.style.width = `${level}%`;
+            if (level < 20) bar.style.backgroundColor = 'var(--danger)';
+            else if (level < 50) bar.style.backgroundColor = 'var(--warning)';
+            else bar.style.backgroundColor = 'var(--success)';
+
+            document.getElementById('battery-percent-label').innerText = `${level}%`;
+            document.getElementById('meta-device').innerText = res.device_info;
+            document.getElementById('meta-serial').innerText = res.serial || 'N/A';
+
+            // Map Status & Health
+            const statusMap = {1:"Unknown", 2:"Charging", 3:"Discharging", 4:"Not charging", 5:"Full"};
+            const healthMap = {1:"Unknown", 2:"Good", 3:"Overheat", 4:"Dead", 5:"Over voltage", 6:"Unspecified", 7:"Cold"};
+
+            document.getElementById('meta-health').innerText = healthMap[res.battery_status.health] || 'Unknown';
+            document.getElementById('meta-temp').innerText = res.battery_status.temperature ? `${res.battery_status.temperature.toFixed(1)}°C` : '--';
+
+            // Badges
+            document.getElementById('dry-run-badge').style.display = res.dry_run ? 'inline-flex' : 'none';
+
+            const rollBadge = document.getElementById('rollback-badge');
+            const revertBtn = document.getElementById('revert-btn');
+            if (res.rollback_exists) {
+                rollBadge.innerText = 'Rollback available';
+                rollBadge.className = 'badge badge-rollback';
+                revertBtn.dataset.locked = '';
+                revertBtn.disabled = false;
+            } else {
+                rollBadge.innerText = 'No saved state';
+                rollBadge.className = 'badge badge-no-rollback';
+                revertBtn.dataset.locked = '1';
+                revertBtn.disabled = true;
+            }
+
+            const samsungBtn = document.getElementById('samsung-btn');
+            const isSamsung = (res.device_info || '').toLowerCase().includes('samsung');
+            samsungBtn.dataset.locked = isSamsung ? '' : '1';
+            samsungBtn.disabled = !isSamsung;
+            if (!isSamsung) {
+                document.getElementById('samsung-desc').innerText = 'Available on Samsung devices only.';
+                document.getElementById('samsung-customize').style.display = 'none';
+            }
+
+            // apiCall is serialized (isBusy guard), so these must run sequentially
+            await loadWhitelist();
+            await loadPackages();
+            await loadSamsungFeatures(isSamsung);
+        }
+
+        let samsungFeaturesLoaded = false;
+        async function loadSamsungFeatures(isSamsung) {
+            if (!isSamsung || samsungFeaturesLoaded) return;
+            const data = await apiCall('GET', '/api/samsung-features');
+            if (!data) return;
+            samsungFeaturesLoaded = true;
+            const box = document.getElementById('samsung-features');
+            box.innerHTML = '';
+            (data.result.features || []).forEach(f => {
+                const label = document.createElement('label');
+                label.className = 'feature-item';
+                label.innerHTML = `<input type="checkbox" class="samsung-feature" value="${f.key}"${f.enabled_by_default ? ' checked' : ''}><span>${f.label}</span>`;
+                box.appendChild(label);
+            });
+        }
+
+        // Whitelist Actions
+        async function loadWhitelist() {
+            const data = await apiCall('GET', '/api/whitelist');
+            if (!data) return;
+            const list = data.result.whitelist || [];
+            const box = document.getElementById('whitelist-box');
+            box.innerHTML = '';
+            if (list.length === 0) {
+                box.innerHTML = '<div class="whitelist-empty">No apps whitelisted.</div>';
+                return;
+            }
+            list.forEach(pkg => {
+                const item = document.createElement('div');
+                item.className = 'whitelist-item';
+                item.innerHTML = `
+                    <span>${pkg}</span>
+                    <button class="btn btn-danger btn-xs" onclick="removeWhitelist('${pkg}')">Remove</button>
+                `;
+                box.appendChild(item);
+            });
+        }
+
+        async function removeWhitelist(pkg) {
+            const data = await apiCall('POST', '/api/whitelist', { action: 'remove', package: pkg });
+            if (data && data.result.changed) {
+                loadWhitelist();
+                appendLogs([`Removed ${pkg} from whitelist.`]);
+            }
+        }
+
+        async function addWhitelist(pkg) {
+            const data = await apiCall('POST', '/api/whitelist', { action: 'add', package: pkg });
+            if (data && data.result.changed) {
+                loadWhitelist();
+                appendLogs([`Added ${pkg} to whitelist.`]);
+            }
+            document.getElementById('whitelist-search-input').value = '';
+            hidePicker();
+        }
+
+        // Package Picker Dropdown
+        async function loadPackages() {
+            const data = await apiCall('GET', '/api/packages');
+            if (data) {
+                installedPackages = data.result.packages || [];
+            }
+        }
+
+        function showPicker() {
+            const drop = document.getElementById('picker-drop');
+            drop.style.display = 'block';
+            filterPicker();
+        }
+
+        function hidePicker() {
+            setTimeout(() => {
+                document.getElementById('picker-drop').style.display = 'none';
+            }, 200);
+        }
+
+        function filterPicker() {
+            const input = document.getElementById('whitelist-search-input').value.toLowerCase();
+            const drop = document.getElementById('picker-drop');
+            drop.innerHTML = '';
+
+            const filtered = installedPackages.filter(pkg => pkg.toLowerCase().includes(input));
+            if (filtered.length === 0) {
+                drop.innerHTML = '<div class="whitelist-empty">No packages found.</div>';
+                return;
+            }
+            filtered.slice(0, 50).forEach(pkg => {
+                const opt = document.createElement('div');
+                opt.className = 'picker-option';
+                opt.innerText = pkg;
+                opt.onclick = () => addWhitelist(pkg);
+                drop.appendChild(opt);
+            });
+        }
+
+        // Actions
+        async function applySafe() {
+            const data = await apiCall('POST', '/api/apply/safe');
+            if (data) showStatus('opt-status', 'Safe profile applied. Rollback saved.');
+            refreshStatus();
+        }
+
+        async function applyExperimental() {
+            const ok = await confirmModal(
+                "Apply Experimental Optimizations",
+                "Experimental optimizations may affect notifications, sync, or device stability. Continue?"
+            );
+            if (ok) {
+                const data = await apiCall('POST', '/api/apply/experimental', { confirm: true });
+                if (data) showStatus('opt-status', 'Experimental profile applied. Rollback saved.');
+                refreshStatus();
+            }
+        }
+
+        async function applySamsung() {
+            const boxes = Array.from(document.querySelectorAll('.samsung-feature'));
+            const excluded = boxes.filter(cb => !cb.checked).map(cb => cb.value);
+            if (boxes.length > 0 && excluded.length === boxes.length) {
+                alert('Select at least one feature to apply.');
+                return;
+            }
+            const scope = boxes.length > 0
+                ? `This applies ${boxes.length - excluded.length} of ${boxes.length} features. `
+                : '';
+            const ok = await confirmModal(
+                "Apply Samsung Experimental",
+                `${scope}Samsung experimental optimizations may affect notifications, sync, or device stability. Continue?`
+            );
+            if (ok) {
+                const data = await apiCall('POST', '/api/apply/samsung-experimental', { confirm: true, exclude: excluded });
+                if (data) showStatus('opt-status', `Samsung profile applied (${boxes.length > 0 ? boxes.length - excluded.length : 'all'} features). Rollback saved.`);
+                refreshStatus();
+            }
+        }
+
+        async function apply120Hz() {
+            const ok = await confirmModal(
+                "Apply 120 Hz Endurance",
+                "120 Hz endurance profile may affect notifications, sync, or device stability. It preserves the 120 Hz screen refresh rate. Continue?"
+            );
+            if (ok) {
+                const data = await apiCall('POST', '/api/apply/120hz-endurance', { confirm: true });
+                if (data) showStatus('opt-status', '120 Hz endurance profile applied and verified. Rollback saved.');
+                refreshStatus();
+            }
+        }
+
+        async function applyRestrictApps() {
+            const lvl = document.getElementById('restrict-apps-level').value;
+            const preview = await apiCall('POST', '/api/restrict-apps/preview', { level: lvl });
+            if (!preview) return;
+            const affected = preview.result.would_change.length;
+            const kept = preview.result.kept_whitelisted.length;
+            const verb = lvl === 'allow' ? 'allow background use for' : 'restrict background use for';
+            const ok = await confirmModal(
+                "Apply App Restrictions",
+                `This will ${verb} ${affected} third-party apps. ${kept} whitelisted apps are kept, and apps in non-restorable standby buckets are skipped automatically. This may affect notifications, sync, or device stability. Continue?`
+            );
+            if (ok) {
+                const data = await apiCall('POST', '/api/restrict-apps', { level: lvl, confirm: true });
+                if (data) {
+                    const skippedNr = (data.result.skipped_non_restorable || []).length;
+                    const keptWl = (data.result.skipped_whitelisted || []).length;
+                    showStatus('opt-status', `Restriction applied to ${affected - skippedNr} apps. ${keptWl} whitelisted kept, ${skippedNr} skipped (non-restorable). Rollback saved.`);
+                }
+                refreshStatus();
+            }
+        }
+
+        async function applyRevert() {
+            const ok = await confirmModal("Revert Saved State", "Restore device settings from the last rollback state? Continue?");
+            if (ok) {
+                const data = await apiCall('POST', '/api/revert');
+                if (data && data.result && data.result.restored) {
+                    const restored = data.result.restored;
+                    appendLogs(restored.length ? restored : ['No saved state found to restore.']);
+                    showStatus('opt-status', restored.length ? `Reverted ${restored.length} saved item(s).` : 'No saved state found to restore.');
+                }
+                refreshStatus();
+            }
+        }
+
+        // Diagnostics
+        async function runDiagnose() {
+            const includeSys = document.getElementById('diag-all-apps').checked;
+            const path = `/api/diagnose?all=${includeSys ? '1' : '0'}`;
+            const data = await apiCall('GET', path);
+            if (!data) return;
+            diagData = data.result.packages || [];
+
+            // Render warnings
+            if (data.result.warnings && data.result.warnings.length > 0) {
+                appendLogs(data.result.warnings.map(w => `Warning: ${w}`), false);
+            }
+
+            filterDiagTable();
+        }
+
+        function filterDiagTable() {
+            const query = document.getElementById('diag-search').value.toLowerCase();
+            const recFilter = document.getElementById('diag-filter-rec').value;
+            const tbody = document.getElementById('diag-tbody');
+            tbody.innerHTML = '';
+
+            const filtered = diagData.filter(pkg => {
+                const matchesSearch = pkg.package.toLowerCase().includes(query);
+                let matchesRec = true;
+                if (recFilter !== 'ALL') {
+                    if (recFilter === 'restrict') {
+                        matchesRec = pkg.recommendation.includes('restrict');
+                    } else {
+                        matchesRec = pkg.recommendation === recFilter;
+                    }
+                }
+                return matchesSearch && matchesRec;
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="cell-muted" style="text-align: center;">No matching diagnostics packages.</td></tr>';
+                return;
+            }
+
+            filtered.forEach(pkg => {
+                const tr = document.createElement('tr');
+                const chipClass = `chip chip-${pkg.recommendation.includes('restrict') ? 'restrict' : pkg.recommendation}`;
+                tr.innerHTML = `
+                    <td style="font-weight: 500;">${pkg.package}</td>
+                    <td class="cell-muted">${bucketName(pkg.standby_bucket)}</td>
+                    <td><span class="${chipClass}">${pkg.recommendation}</span></td>
+                    <td class="cell-muted">${pkg.reason || ''}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function sortDiagTable(colIndex) {
+            sortDirections[colIndex] = -sortDirections[colIndex];
+            const dir = sortDirections[colIndex];
+            diagData.sort((a, b) => {
+                let valA = '', valB = '';
+                if (colIndex === 0) { valA = a.package; valB = b.package; }
+                else if (colIndex === 1) { valA = a.standby_bucket || ''; valB = b.standby_bucket || ''; }
+                else if (colIndex === 2) { valA = a.recommendation; valB = b.recommendation; }
+                else if (colIndex === 3) { valA = a.reason || ''; valB = b.reason || ''; }
+                return valA.localeCompare(valB) * dir;
+            });
+            filterDiagTable();
+        }
+
+        // Smart Restrict preview / apply
+        async function previewSmartRestrict() {
+            const aggressive = document.getElementById('sr-aggressive').checked;
+            const daysInput = document.getElementById('sr-days').value;
+            const payload = { aggressive: aggressive };
+            if (daysInput !== '') payload.min_last_used_days = parseInt(daysInput);
+
+            const data = await apiCall('POST', '/api/smart-restrict/preview', payload);
+            if (!data) return;
+
+            const res = data.result;
+            const wouldRestrict = res.would_restrict || [];
+            const skipped = res.skipped || [];
+            const kept = res.kept || [];
+
+            document.getElementById('sr-preview-summary').innerText = `Preview: would restrict ${wouldRestrict.length}, skipped ${skipped.length}, kept ${kept.length}`;
+            document.getElementById('sr-preview-summary').style.display = 'block';
+
+            const tbody = document.getElementById('sr-tbody');
+            tbody.innerHTML = '';
+
+            wouldRestrict.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td style="font-weight: 500;">${item.package}</td>
+                    <td class="cell-danger">Restrict (from ${bucketName(item.bucket)})</td>
+                    <td class="cell-muted">${item.reason}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            skipped.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td style="font-weight: 500;">${item.package}</td>
+                    <td class="cell-muted">Skip</td>
+                    <td class="cell-muted">${item.reason}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            kept.forEach(item => {
+                const tr = document.createElement('tr');
+                const wlChip = (item.reason || '').toLowerCase().includes('whitelist')
+                    ? ' <span class="chip chip-keep">whitelisted</span>' : '';
+                tr.innerHTML = `
+                    <td style="font-weight: 500;">${item.package}</td>
+                    <td class="cell-success">Keep${wlChip}</td>
+                    <td class="cell-muted">${item.reason}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('sr-preview-container').style.display = 'block';
+
+            const applyBtn = document.getElementById('sr-apply-btn');
+            applyBtn.dataset.locked = '';
+            applyBtn.disabled = false;
+            applyBtn.title = '';
+        }
+
+        async function applySmartRestrict() {
+            const aggressive = document.getElementById('sr-aggressive').checked;
+            const daysInput = document.getElementById('sr-days').value;
+            const ok = await confirmModal(
+                "Apply Smart Restrict",
+                "Apply smart-restrict automatically on identified background apps? Continue?"
+            );
+            if (!ok) return;
+
+            const payload = { aggressive: aggressive, confirm: true };
+            if (daysInput !== '') payload.min_last_used_days = parseInt(daysInput);
+
+            const data = await apiCall('POST', '/api/smart-restrict/apply', payload);
+            if (data) {
+                refreshStatus();
+                document.getElementById('sr-preview-container').style.display = 'none';
+                document.getElementById('sr-preview-summary').style.display = 'none';
+                const res = data.result || {};
+                const counts = `restricted ${(res.applied || []).length}, skipped ${(res.skipped || []).length}, kept ${(res.kept || []).length}`;
+                showStatus('sr-status', `Smart restrict applied: ${counts}. Rollback saved.`);
+                appendLogs(['Smart restrict applied successfully.']);
+            }
+        }
+
+        // Initialize on load
+        window.addEventListener('click', (e) => {
+            if (!e.target.matches('#whitelist-search-input')) {
+                hidePicker();
+            }
+        });
+        refreshStatus();
+    </script>
+</body>
+</html>

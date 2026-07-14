@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 
 @dataclass
@@ -11,6 +11,7 @@ class DeviceInfo:
     android_release: str
     sdk_int: int
     fingerprint: str
+
 
 def parse_adb_devices(output: str) -> List[Dict[str, str]]:
     devices: List[Dict[str, str]] = []
@@ -30,6 +31,7 @@ def parse_adb_devices(output: str) -> List[Dict[str, str]]:
             if len(parts) >= 2:
                 devices.append({"serial": parts[0], "status": parts[1]})
     return devices
+
 
 def resolve_package_choice(query: str, packages: Sequence[str]) -> List[str]:
     normalized = query.strip()
@@ -56,3 +58,68 @@ def parse_builtin_refresh_rates(output: str) -> List[float]:
         except ValueError:
             return []
     return []
+
+
+def parse_battery_dumpsys(text: str) -> Dict[str, Any]:
+    res = {
+        "level": None,
+        "status": None,
+        "health": None,
+        "temperature": None,
+        "plugged": False,
+        "charge_counter": None
+    }
+    ac = False
+    usb = False
+    wireless = False
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        v_lower = v.lower()
+
+        if k == "level":
+            try:
+                res["level"] = int(v)
+            except ValueError:
+                pass
+        elif k == "status":
+            try:
+                res["status"] = int(v)
+            except ValueError:
+                pass
+        elif k == "health":
+            try:
+                res["health"] = int(v)
+            except ValueError:
+                pass
+        elif k in ("temperature", "temp"):
+            try:
+                res["temperature"] = float(v) / 10.0
+            except ValueError:
+                pass
+        elif k == "charge counter":
+            try:
+                res["charge_counter"] = int(v)
+            except ValueError:
+                pass
+        elif k == "ac powered":
+            ac = (v_lower == "true")
+        elif k == "usb powered":
+            usb = (v_lower == "true")
+        elif k == "wireless powered":
+            wireless = (v_lower == "true")
+        elif k == "plugged":
+            try:
+                val = int(v)
+                if val > 0:
+                    res["plugged"] = True
+            except ValueError:
+                if v_lower == "true":
+                    res["plugged"] = True
+    if ac or usb or wireless:
+        res["plugged"] = True
+    return res
+

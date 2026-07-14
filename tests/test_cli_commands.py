@@ -36,6 +36,12 @@ class TestCLICommands(unittest.TestCase):
         self.assertEqual(args.command, "diagnose")
         self.assertFalse(args.third_party_only)
 
+    def test_parse_gui_subcommand(self):
+        args = parse_args(["gui", "--port", "0", "--no-browser"])
+        self.assertEqual(args.command, "gui")
+        self.assertEqual(args.port, 0)
+        self.assertTrue(args.no_browser)
+
     def test_parse_smart_restrict_subcommand(self):
         args = parse_args(["smart-restrict"])
         self.assertEqual(args.command, "smart-restrict")

@@ -523,7 +523,7 @@ class OptimizerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             app, cli, outputs = self.make_app_and_cli(
-                Path(tmp), user_inputs=["3", "n", "9"], capture_output=True
+                Path(tmp), user_inputs=["3", "n", "11"], capture_output=True
             )
             cli.client.serial = "serial-1"
 

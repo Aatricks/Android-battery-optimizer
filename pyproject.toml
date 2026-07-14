@@ -36,6 +36,9 @@ android-battery-optimizer = "android_battery_optimizer.cli:main"
 where = ["."]
 include = ["android_battery_optimizer*"]
 
+[tool.setuptools.package-data]
+android_battery_optimizer = ["webui.html"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

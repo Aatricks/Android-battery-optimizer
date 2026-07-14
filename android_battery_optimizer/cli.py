@@ -8,6 +8,7 @@ from .adb import AdbClient, CommandError, SubprocessRunner
 from .android import parse_adb_devices, resolve_package_choice
 from .app import BatteryOptimizerApp
 from .recorder import SnapshotError, VerificationError
+from .term import Formatter, render_table, supports_color
 
 APP_NAME = "android-battery-optimizer"
 DEFAULT_STATE_DIR = (
@@ -92,7 +93,52 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Check saved state for non-restorable standby bucket entries"
     )
 
+    parser_gui = add_subparser("gui", help="Launch local Web GUI")
+    parser_gui.add_argument(
+        "--port", type=int, default=8765, help="Port to bind (default: 8765, 0 = ephemeral)"
+    )
+    parser_gui.add_argument(
+        "--no-browser", action="store_true", help="Do not automatically open the browser"
+    )
+
     return parser.parse_args(argv)
+
+STATUS_MAP = {
+    1: "Unknown",
+    2: "Charging",
+    3: "Discharging",
+    4: "Not charging",
+    5: "Full"
+}
+
+HEALTH_MAP = {
+    1: "Unknown",
+    2: "Good",
+    3: "Overheat",
+    4: "Dead",
+    5: "Over voltage",
+    6: "Unspecified failure",
+    7: "Cold"
+}
+
+
+def format_hours(ms) -> str:
+    if ms is None:
+        return "unavailable"
+    try:
+        return f"{ms / 3600000.0:.2f} hours"
+    except (TypeError, ValueError):
+        return "unavailable"
+
+
+def format_percent(val) -> str:
+    if val is None:
+        return "unavailable"
+    try:
+        return f"{val}%"
+    except (TypeError, ValueError):
+        return "unavailable"
+
 
 class BatteryOptimizerCLI:
     def __init__(
@@ -100,11 +146,16 @@ class BatteryOptimizerCLI:
         app: BatteryOptimizerApp,
         output: Callable[[str], None] = print,
         input_fn: Callable[[str], str] = input,
+        formatter: Optional[Formatter] = None,
     ) -> None:
         self.app = app
         self.client = app.client
         self.output = output
         self.input = input_fn
+        self.formatter = formatter if formatter is not None else Formatter(enabled=False)
+
+    def _error(self, exc: Exception) -> None:
+        self.output(f"{self.formatter.err('Error:')} {exc}")
 
     def check_environment(self) -> bool:
         if not self.client.adb_exists():
@@ -170,7 +221,43 @@ class BatteryOptimizerCLI:
 
     def check_battery(self) -> None:
         self.output("\n--- Battery Status ---")
-        self.output(self.client.shell_text(["dumpsys", "battery"], check=False))
+        status_dict = self.app.get_battery_status()
+
+        status_val = STATUS_MAP.get(
+            status_dict.get("status"), f"Unknown ({status_dict.get('status')})"
+        ) if status_dict.get("status") is not None else "Unknown"
+        health_val = HEALTH_MAP.get(
+            status_dict.get("health"), f"Unknown ({status_dict.get('health')})"
+        ) if status_dict.get("health") is not None else "Unknown"
+
+        temp_val = (
+            f"{status_dict['temperature']:.1f}°C"
+            if status_dict.get("temperature") is not None
+            else "unknown"
+        )
+        level_val = (
+            f"{status_dict['level']}%" if status_dict.get("level") is not None else "unknown"
+        )
+        plugged_val = "Yes" if status_dict.get("plugged") else "No"
+
+        charge_counter_val = status_dict.get("charge_counter")
+        if charge_counter_val is not None:
+            charge_val = f"{charge_counter_val / 1000.0:.0f} mAh"
+        else:
+            charge_val = "unknown"
+
+        rows = [
+            ["Level", level_val],
+            ["Status", status_val],
+            ["Health", health_val],
+            ["Temperature", temp_val],
+            ["Plugged", plugged_val],
+            ["Charge counter", charge_val]
+        ]
+
+        for line in render_table(["PROPERTY", "VALUE"], rows):
+            self.output(f"  {line}")
+
         self.output("\n--- BatteryStats Summary (Since Charged) ---")
         output = self.client.shell_text(["dumpsys", "batterystats", "--charged"], check=False)
         found = False
@@ -223,11 +310,9 @@ class BatteryOptimizerCLI:
                         self.output("Invalid selection.")
                         continue
                     package = matches[item - 1]
-                if package not in whitelist:
-                    whitelist.append(package)
-                    whitelist.sort()
-                    self.app.save_whitelist(whitelist)
+                if self.app.add_to_whitelist(package):
                     self.output(f"Added {package}.")
+                    whitelist = self.app.load_whitelist()
                 else:
                     self.output(f"{package} is already whitelisted.")
             elif choice == "2":
@@ -242,9 +327,10 @@ class BatteryOptimizerCLI:
                 if item < 1 or item > len(whitelist):
                     self.output("Invalid selection.")
                     continue
-                removed = whitelist.pop(item - 1)
-                self.app.save_whitelist(whitelist)
-                self.output(f"Removed {removed}.")
+                removed = whitelist[item - 1]
+                if self.app.remove_from_whitelist(removed):
+                    self.output(f"Removed {removed}.")
+                    whitelist = self.app.load_whitelist()
             elif choice == "3":
                 return
             else:
@@ -317,31 +403,15 @@ class BatteryOptimizerCLI:
                 report = self.app.diagnose(third_party_only=args.third_party_only)
 
                 if report["warnings"]:
-                    self.output("\nWarnings:")
+                    self.output(f"\n{self.formatter.warn('Warnings:')}")
                     for w in report["warnings"]:
-                        self.output(f"  {w}")
+                        self.output(f"  {self.formatter.warn(w)}")
 
                 system = report.get("system", {})
                 obs_ms = system.get("observation_ms")
                 soff_ms = system.get("screen_off_ms")
                 son_drain = system.get("screen_on_drain_percent")
                 soff_drain = system.get("screen_off_drain_percent")
-
-                def format_hours(ms):
-                    if ms is None:
-                        return "unavailable"
-                    try:
-                        return f"{ms / 3600000.0:.2f} hours"
-                    except (TypeError, ValueError):
-                        return "unavailable"
-
-                def format_percent(val):
-                    if val is None:
-                        return "unavailable"
-                    try:
-                        return f"{val}%"
-                    except (TypeError, ValueError):
-                        return "unavailable"
 
                 self.output("\nBattery Summary:")
                 self.output(f"  Observation duration: {format_hours(obs_ms)}")
@@ -350,11 +420,28 @@ class BatteryOptimizerCLI:
                 self.output(f"  Screen-off drain: {format_percent(soff_drain)}")
 
                 self.output("\nDiagnosis Summary:")
+                table_rows = []
                 for pkg in report["packages"]:
-                    self.output(
-                        f"  {pkg['package']}: {pkg['recommendation']} "
-                        f"({pkg['reason']})"
-                    )
+                    rec = pkg["recommendation"]
+                    if rec == "keep":
+                        styled_rec = self.formatter.ok(rec)
+                    elif rec == "review":
+                        styled_rec = self.formatter.warn(rec)
+                    elif rec in ("restrict", "aggressive_restrict"):
+                        styled_rec = self.formatter.err(rec)
+                    else:
+                        styled_rec = rec
+
+                    table_rows.append([
+                        pkg["package"],
+                        pkg.get("standby_bucket") or "unknown",
+                        styled_rec,
+                        pkg.get("reason") or ""
+                    ])
+
+                headers = ["PACKAGE", "BUCKET", "RECOMMENDATION", "REASON"]
+                for line in render_table(headers, table_rows):
+                    self.output(f"  {line}")
 
                 if report.get("doze_whitelist_user"):
                     self.output("\nApps bypassing Doze (user whitelisted):")
@@ -381,39 +468,80 @@ class BatteryOptimizerCLI:
                 )
 
                 if result.get("warnings"):
-                    self.output("\nWarnings:")
+                    self.output(f"\n{self.formatter.warn('Warnings:')}")
                     for w in result["warnings"]:
-                        self.output(f"  {w}")
+                        self.output(f"  {self.formatter.warn(w)}")
 
                 applied = result.get("applied", [])
                 skipped = result.get("skipped", [])
                 kept = result.get("kept", [])
 
                 self.output("\nSmart restrict summary:")
-                self.output(f"  Restricted: {len(applied)}")
-                self.output(f"  Skipped: {len(skipped)}")
-                self.output(f"  Kept: {len(kept)}")
+                if self.formatter.enabled:
+                    self.output(f"  Restricted: {self.formatter.err(str(len(applied)))}")
+                    self.output(f"  Skipped: {self.formatter.warn(str(len(skipped)))}")
+                    self.output(f"  Kept: {self.formatter.ok(str(len(kept)))}")
+                else:
+                    self.output(f"  Restricted: {len(applied)}")
+                    self.output(f"  Skipped: {len(skipped)}")
+                    self.output(f"  Kept: {len(kept)}")
 
                 if applied:
-                    if args.dry_run:
-                        self.output("\nWould restrict (dry-run):")
+                    if self.formatter.enabled:
+                        if args.dry_run:
+                            self.output(f"\n{self.formatter.accent('Would restrict (dry-run):')}")
+                        else:
+                            self.output(f"\n{self.formatter.accent('Restricted:')}")
+
+                        headers = ["PACKAGE", "BACKGROUND OP", "STANDBY BUCKET", "REASON"]
+                        has_wl = any("wake_lock" in item for item in applied)
+                        if has_wl:
+                            headers = [
+                                "PACKAGE", "BACKGROUND OP", "WAKE LOCK",
+                                "STANDBY BUCKET", "REASON"
+                            ]
+
+                        rows = []
+                        for item in applied:
+                            bg_op = item['appop']
+                            bucket = item['bucket']
+                            reason = item['reason']
+                            if has_wl:
+                                wl = item.get('wake_lock', '-')
+                                rows.append([item['package'], bg_op, wl, bucket, reason])
+                            else:
+                                rows.append([item['package'], bg_op, bucket, reason])
+
+                        for line in render_table(headers, rows):
+                            self.output(f"  {line}")
                     else:
-                        self.output("\nRestricted:")
-                    for item in applied:
-                        msg = (
-                            f"  {item['package']} -> "
-                            f"RUN_ANY_IN_BACKGROUND={item['appop']}, "
-                            f"bucket={item['bucket']}"
-                        )
-                        if "wake_lock" in item:
-                            msg += f", WAKE_LOCK={item['wake_lock']}"
-                        self.output(msg)
-                        self.output(f"    Reason: {item['reason']}")
+                        if args.dry_run:
+                            self.output("\nWould restrict (dry-run):")
+                        else:
+                            self.output("\nRestricted:")
+                        for item in applied:
+                            msg = (
+                                f"  {item['package']} -> "
+                                f"RUN_ANY_IN_BACKGROUND={item['appop']}, "
+                                f"bucket={item['bucket']}"
+                            )
+                            if "wake_lock" in item:
+                                msg += f", WAKE_LOCK={item['wake_lock']}"
+                            self.output(msg)
+                            self.output(f"    Reason: {item['reason']}")
 
                 if skipped:
-                    self.output("\nSkipped:")
-                    for item in skipped:
-                        self.output(f"  {item['package']} -> {item['reason']}")
+                    if self.formatter.enabled:
+                        self.output(f"\n{self.formatter.accent('Skipped:')}")
+                        rows = []
+                        for item in skipped:
+                            rows.append([item['package'], item['reason']])
+                        for line in render_table(["PACKAGE", "REASON"], rows):
+                            self.output(f"  {line}")
+                    else:
+                        self.output("\nSkipped:")
+                        for item in skipped:
+                            self.output(f"  {item['package']} -> {item['reason']}")
 
                 if not args.dry_run:
                     self.output("\nSmart restrict applied successfully.")
@@ -454,29 +582,33 @@ class BatteryOptimizerCLI:
                     for pkg in whitelist:
                         self.output(pkg)
                 elif args.wl_command == "add":
+                    # add_to_whitelist validates package first and raises ValueError on error
                     try:
-                        self.app.validate_package(args.package)
+                        if self.app.add_to_whitelist(args.package):
+                            self.output(f"Added {args.package} to whitelist.")
+                        else:
+                            self.output(f"{args.package} is already whitelisted.")
                     except ValueError as exc:
                         self.output(f"Error: {exc}")
                         return 1
-                    if args.package not in whitelist:
-                        whitelist.append(args.package)
-                        whitelist.sort()
-                        self.app.save_whitelist(whitelist)
-                        self.output(f"Added {args.package} to whitelist.")
-                    else:
-                        self.output(f"{args.package} is already whitelisted.")
                 elif args.wl_command == "remove":
-                    if args.package in whitelist:
-                        whitelist.remove(args.package)
-                        self.app.save_whitelist(whitelist)
+                    if self.app.remove_from_whitelist(args.package):
                         self.output(f"Removed {args.package} from whitelist.")
                     else:
                         self.output(f"{args.package} not found in whitelist.")
                 return 0
 
+            elif args.command == "gui":
+                from .webgui import serve
+                return serve(
+                    self.app,
+                    port=args.port,
+                    open_browser=not args.no_browser,
+                    output=self.output,
+                )
+
         except (CommandError, ValueError, SnapshotError, VerificationError) as exc:
-            self.output(f"Error: {exc}")
+            self._error(exc)
             return 1
         return 0
 
@@ -487,16 +619,23 @@ class BatteryOptimizerCLI:
         device = self.app.get_device_info()
         self.output(f"Connected to: {device}")
         while True:
-            self.output("\n--- Android Battery Optimizer ---")
-            self.output("1. Check Battery Status")
-            self.output("2. Apply Documented Safe Optimizations")
-            self.output("3. Apply Experimental Optimizations")
-            self.output("4. Apply Samsung Experimental Optimizations")
-            self.output("5. Restrict 3rd Party Apps (Experimental, with Whitelist)")
-            self.output("6. Manage Whitelist")
-            self.output("7. Run Background Optimization (Dexopt, Experimental)")
-            self.output("8. Revert Saved State")
-            self.output("9. Exit")
+            self.output(f"\n{self.formatter.header('--- Android Battery Optimizer ---')}")
+            self.output(f"\n{self.formatter.bold('Status')}")
+            self.output("  1. Check Battery Status")
+            self.output(f"\n{self.formatter.bold('Optimizations')}")
+            self.output("  2. Apply Documented Safe Optimizations")
+            self.output("  3. Apply Experimental Optimizations")
+            self.output("  4. Apply Samsung Experimental Optimizations")
+            self.output("  5. Restrict 3rd Party Apps (Experimental, with Whitelist)")
+            self.output("  9. Apply 120Hz Endurance Profile")
+            self.output(f"\n{self.formatter.bold('App management')}")
+            self.output("  6. Manage Whitelist")
+            self.output(f"\n{self.formatter.bold('Maintenance')}")
+            self.output("  7. Run Background Optimization (Dexopt, Experimental)")
+            self.output("  8. Revert Saved State")
+            self.output("  10. Launch Web GUI")
+            self.output("  11. Exit")
+
             choice = self.input("\nSelect an option: ").strip()
             try:
                 if choice == "1":
@@ -553,11 +692,22 @@ class BatteryOptimizerCLI:
                             self.output(f"  {msg}")
                         self.output("Restore finished.")
                 elif choice == "9":
+                    if not self.confirm_experimental("120 Hz endurance profile"):
+                        self.output("Skipped 120 Hz endurance profile.")
+                        continue
+                    self.output("Applying the reversible 120 Hz endurance profile...")
+                    self.app.apply_120hz_endurance_profile()
+                    self.output("120 Hz endurance profile applied and verified.")
+                elif choice == "10":
+                    self.output("Launching Web GUI...")
+                    from .webgui import serve
+                    serve(self.app, port=8765, open_browser=True, output=self.output)
+                elif choice == "11":
                     return 0
                 else:
                     self.output("Invalid selection.")
             except (CommandError, ValueError, SnapshotError, VerificationError) as exc:
-                self.output(f"Error: {exc}")
+                self._error(exc)
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
@@ -568,7 +718,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dry_run=args.dry_run,
     )
     app = BatteryOptimizerApp(client=client, state_dir=state_dir)
-    cli = BatteryOptimizerCLI(app=app)
+    fmt = Formatter(enabled=supports_color(sys.stdout))
+    cli = BatteryOptimizerCLI(app=app, formatter=fmt)
     if args.command:
         return cli.run_command(args)
     return cli.run()

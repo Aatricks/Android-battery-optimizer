@@ -1,15 +1,79 @@
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .adb import AdbClient, CommandError
-from .android import parse_builtin_refresh_rates
+from .android import parse_battery_dumpsys, parse_builtin_refresh_rates
 from .recorder import StateRecorder
 from .state import StateStore
 from .verification import VerificationError
 
 WHITELIST_FILE = "whitelist.txt"
+
+# Samsung experimental profile, grouped into user-recognizable features.
+# Each entry: feature key -> (label, enabled_by_default, [(namespace, setting, value)]).
+SAMSUNG_FEATURES: Dict[str, Tuple[str, bool, List[Tuple[str, str, str]]]] = {
+    "motion_gestures": (
+        "Motion and air gestures",
+        True,
+        [
+            ("system", "master_motion", "0"),
+            ("system", "motion_engine", "0"),
+            ("system", "air_motion_engine", "0"),
+            ("system", "air_motion_wake_up", "0"),
+        ],
+    ),
+    "continuity": (
+        "Cross-device continuity",
+        True,
+        [("system", "mcf_continuity", "0")],
+    ),
+    "smart_sleep": (
+        "Smart stay / adaptive sleep",
+        True,
+        [
+            ("system", "intelligent_sleep_mode", "0"),
+            ("secure", "adaptive_sleep", "0"),
+        ],
+    ),
+    "nearby_scanning": (
+        "Nearby device scanning",
+        True,
+        [
+            ("system", "nearby_scanning_enabled", "0"),
+            ("system", "nearby_scanning_permission_allowed", "0"),
+        ],
+    ),
+    "aod": (
+        "Always-on display",
+        True,
+        [("system", "aod_mode", "0")],
+    ),
+    "ram_plus": (
+        "RAM Plus (memory expansion)",
+        True,
+        [("global", "ram_expand_size", "0")],
+    ),
+    "enhanced_processing": (
+        "Enhanced processing",
+        True,
+        [("global", "enhanced_processing", "0")],
+    ),
+    "vibration": (
+        "Vibration",
+        False,
+        [("secure", "vibration_on", "0")],
+    ),
+    "game_optimizations": (
+        "Game temperature control and Bixby block",
+        True,
+        [
+            ("secure", "game_auto_temperature_control", "0"),
+            ("secure", "game_bixby_block", "1"),
+        ],
+    ),
+}
 
 class BatteryOptimizerApp:
     def __init__(self, client: AdbClient, state_dir: Path) -> None:
@@ -64,6 +128,36 @@ class BatteryOptimizerApp:
         with self.whitelist_path.open("w", encoding="utf-8") as handle:
             for package in packages:
                 handle.write(f"{package}\n")
+
+    def get_battery_status(self) -> Dict[str, Any]:
+        return parse_battery_dumpsys(
+            self.client.shell_text(["dumpsys", "battery"], check=False)
+        )
+
+    def add_to_whitelist(self, package: str) -> bool:
+        package = package.strip()
+        if not package:
+            raise ValueError("Package name cannot be empty.")
+        self.validate_package(package)
+        whitelist = self.load_whitelist()
+        if package in whitelist:
+            return False
+        whitelist.append(package)
+        whitelist.sort()
+        self.save_whitelist(whitelist)
+        return True
+
+    def remove_from_whitelist(self, package: str) -> bool:
+        package = package.strip()
+        if not package:
+            raise ValueError("Package name cannot be empty.")
+        whitelist = self.load_whitelist()
+        if package not in whitelist:
+            return False
+        whitelist.remove(package)
+        self.save_whitelist(whitelist)
+        return True
+
 
 
     def get_device_info(self) -> str:
@@ -260,7 +354,18 @@ class BatteryOptimizerApp:
                         )
                 self.recorder.set_netpolicy_restrict_background(True)
 
-    def apply_samsung_experimental_optimizations(self) -> None:
+    def apply_samsung_experimental_optimizations(
+        self, exclude: Optional[Sequence[str]] = None
+    ) -> None:
+        excluded = set(exclude or [])
+        unknown = excluded - set(SAMSUNG_FEATURES)
+        if unknown:
+            raise ValueError(
+                f"Unknown Samsung feature keys: {', '.join(sorted(unknown))}"
+            )
+        if excluded == set(SAMSUNG_FEATURES):
+            raise ValueError("All Samsung features are excluded; nothing to apply.")
+
         info = self.client.get_device_info_struct()
         if info.brand.lower() != "samsung":
             raise ValueError("Connected device is not Samsung.")
@@ -273,31 +378,10 @@ class BatteryOptimizerApp:
                 )
 
         with self.recorder.transaction():
-            samsung_settings = {
-                "system": {
-                    "master_motion": "0",
-                    "motion_engine": "0",
-                    "air_motion_engine": "0",
-                    "air_motion_wake_up": "0",
-                    "mcf_continuity": "0",
-                    "intelligent_sleep_mode": "0",
-                    "nearby_scanning_enabled": "0",
-                    "nearby_scanning_permission_allowed": "0",
-                    "aod_mode": "0",
-                },
-                "global": {
-                    "ram_expand_size": "0",
-                    "enhanced_processing": "0",
-                },
-                "secure": {
-                    "vibration_on": "0",
-                    "adaptive_sleep": "0",
-                    "game_auto_temperature_control": "0",
-                    "game_bixby_block": "1",
-                },
-            }
-            for namespace, values in samsung_settings.items():
-                for key, value in values.items():
+            for feature, (_label, _default, settings) in SAMSUNG_FEATURES.items():
+                if feature in excluded:
+                    continue
+                for namespace, key, value in settings:
                     self.recorder.put_setting(namespace, key, value)
 
     def _display_supports_120hz(self) -> bool:
@@ -362,6 +446,15 @@ class BatteryOptimizerApp:
         return {
             "skipped_whitelisted": skipped_whitelisted,
             "skipped_non_restorable": skipped_non_restorable
+        }
+
+    def preview_restrict_background_apps(self, level: str = "ignore") -> Dict[str, Any]:
+        whitelist = set(self.load_whitelist())
+        packages = self.get_packages(third_party=True)
+        return {
+            "level": level,
+            "would_change": [p for p in packages if p not in whitelist],
+            "kept_whitelisted": [p for p in packages if p in whitelist],
         }
 
     def run_bg_dexopt(self) -> None:
@@ -477,6 +570,126 @@ class BatteryOptimizerApp:
     def _get_critical_packages(self) -> Set[str]:
         return set(self._get_protected_packages())
 
+    def _classify_for_restrict(
+        self,
+        pkg_info: Dict[str, Any],
+        whitelist: Set[str],
+        protected: Dict[str, str],
+        aggressive: bool,
+        min_last_used_days: Optional[int],
+        now_ms: float,
+    ) -> Tuple[str, str]:
+        pkg = pkg_info["package"]
+        if pkg in whitelist:
+            return "skip", "whitelisted"
+        if pkg in protected:
+            return "skip", f"protected:{protected[pkg]}"
+
+        if min_last_used_days is not None:
+            last_used = pkg_info.get("signals", {}).get("last_used", {})
+            if last_used.get("parsed"):
+                last_used_ms = float(last_used["epoch_ms"])
+                time_diff = now_ms - last_used_ms
+                if time_diff < (min_last_used_days * 86400 * 1000):
+                    return "skip", "recently_used"
+            else:
+                return "skip", "last_used_unknown"
+
+        rec = pkg_info["recommendation"]
+        reason = pkg_info.get("reason", "")
+
+        if rec in ("keep", "review"):
+            return "keep", reason
+
+        if aggressive and rec == "aggressive_restrict":
+            return "aggressive_restrict", reason
+        elif not aggressive and rec in ("restrict", "aggressive_restrict"):
+            return "restrict", reason
+
+        return "skip", "unsupported_recommendation"
+
+    def preview_smart_restrict(
+        self,
+        aggressive: bool = False,
+        min_last_used_days: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        whitelist = set(self.load_whitelist())
+        protected = self._get_protected_packages()
+
+        would_restrict = []
+        skipped = []
+        kept = []
+
+        report = self.diagnose(third_party_only=True)
+        warnings = report.get("warnings", [])
+
+        import time
+
+        from .operations import normalize_restorable_bucket
+
+        current_time_ms = time.time() * 1000
+
+        for pkg_info in report["packages"]:
+            pkg = pkg_info["package"]
+            action, reason = self._classify_for_restrict(
+                pkg_info,
+                whitelist,
+                protected,
+                aggressive,
+                min_last_used_days,
+                current_time_ms,
+            )
+
+            if action == "skip":
+                skipped.append({"package": pkg, "reason": reason})
+            elif action == "keep":
+                kept.append({"package": pkg, "reason": reason})
+            else:
+                prior_bucket = pkg_info.get("standby_bucket")
+                if prior_bucket is None:
+                    skipped.append(
+                        {"package": pkg, "reason": "standby_bucket_unreadable"}
+                    )
+                    continue
+
+                try:
+                    normalize_restorable_bucket(prior_bucket)
+                except ValueError:
+                    skipped.append(
+                        {
+                            "package": pkg,
+                            "reason": "non_restorable_standby_bucket",
+                        }
+                    )
+                    continue
+
+                if action == "aggressive_restrict":
+                    would_restrict.append(
+                        {
+                            "package": pkg,
+                            "appop": "ignore",
+                            "wake_lock": "ignore",
+                            "bucket": "restricted",
+                            "reason": reason,
+                        }
+                    )
+                elif action == "restrict":
+                    would_restrict.append(
+                        {
+                            "package": pkg,
+                            "appop": "ignore",
+                            "bucket": "rare",
+                            "reason": reason,
+                        }
+                    )
+
+        return {
+            "would_restrict": would_restrict,
+            "skipped": skipped,
+            "kept": kept,
+            "warnings": warnings,
+        }
+
     def smart_restrict(
         self,
         aggressive: bool = False,
@@ -531,41 +744,19 @@ class BatteryOptimizerApp:
             self.recorder.prefetch_package_states()
             for pkg_info in report["packages"]:
                 pkg = pkg_info["package"]
-                if pkg in whitelist:
-                    skipped.append({"package": pkg, "reason": "whitelisted"})
+                action, reason = self._classify_for_restrict(
+                    pkg_info,
+                    whitelist,
+                    protected,
+                    aggressive,
+                    min_last_used_days,
+                    current_time_ms,
+                )
+
+                if action == "skip":
+                    skipped.append({"package": pkg, "reason": reason})
                     continue
-                if pkg in protected:
-                    skipped.append(
-                        {
-                            "package": pkg,
-                            "reason": f"protected:{protected[pkg]}",
-                        }
-                    )
-                    continue
-
-                if min_last_used_days is not None:
-                    last_used = (
-                        pkg_info.get("signals", {})
-                        .get("last_used", {})
-                    )
-                    if last_used.get("parsed"):
-                        last_used_ms = float(last_used["epoch_ms"])
-                        time_diff = current_time_ms - last_used_ms
-                        if time_diff < (min_last_used_days * 86400 * 1000):
-                            skipped.append(
-                                {"package": pkg, "reason": "recently_used"}
-                            )
-                            continue
-                    else:
-                        skipped.append(
-                            {"package": pkg, "reason": "last_used_unknown"}
-                        )
-                        continue
-
-                rec = pkg_info["recommendation"]
-                reason = pkg_info.get("reason", "")
-
-                if rec in ("keep", "review"):
+                if action == "keep":
                     kept.append({"package": pkg, "reason": reason})
                     continue
 
@@ -588,7 +779,7 @@ class BatteryOptimizerApp:
                     )
                     continue
 
-                if aggressive and rec == "aggressive_restrict":
+                if action == "aggressive_restrict":
                     self.recorder.set_appop(
                         pkg, "RUN_ANY_IN_BACKGROUND", "ignore"
                     )
@@ -617,10 +808,7 @@ class BatteryOptimizerApp:
                             "reason": reason,
                         }
                     )
-                elif not aggressive and rec in (
-                    "restrict",
-                    "aggressive_restrict",
-                ):
+                elif action == "restrict":
                     self.recorder.set_appop(
                         pkg, "RUN_ANY_IN_BACKGROUND", "ignore"
                     )
@@ -645,13 +833,6 @@ class BatteryOptimizerApp:
                             "reason": reason,
                         }
                     )
-                else:
-                    skipped.append(
-                        {
-                            "package": pkg,
-                            "reason": "unsupported_recommendation",
-                        }
-                    )
 
         return {
             "applied": applied,
@@ -659,3 +840,4 @@ class BatteryOptimizerApp:
             "kept": kept,
             "warnings": warnings
         }
+
