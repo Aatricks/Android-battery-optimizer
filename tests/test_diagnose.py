@@ -198,3 +198,52 @@ class TestDiagnose(unittest.TestCase):
 
         self.assertEqual(recommendation, "keep")
         self.assertIn("Insufficient observation window", reason)
+
+
+class AlarmSinceBootTests(unittest.TestCase):
+    # Shape copied from a real Galaxy S22 `dumpsys alarm` (Android 16).
+    SAMPLE = (
+        "  nowRTC=1795427449430=2026-11-23 10:50:49.430 nowELAPSED=604800000\n"
+        "  Top Alarms:\n"
+        "    +7m13s305ms running, 0 wakeups, 856 alarms: u0a475:com.instagram.android\n"
+        "  Alarm Stats:\n"
+        "  1000:android +5m38s326ms running, 4357 wakeups:\n"
+        "    +1s 8 wakes 8 alarms, last -21h:\n"
+        "  u0a475:com.instagram.android +7m13s running, 700 wakeups:\n"
+        "  u0a99:com.chatty +1s running, 7000 wakeups:\n"
+    )
+
+    def test_counts_are_per_24h_from_alarm_stats_only(self):
+        from android_battery_optimizer.diagnose import parse_alarm_stats_since_boot
+
+        wakeups, elapsed = parse_alarm_stats_since_boot(self.SAMPLE)  # 7 days up
+        self.assertEqual(elapsed, 604800000)
+        self.assertEqual(wakeups["com.instagram.android"], 100)
+        self.assertEqual(wakeups["com.chatty"], 1000)
+        self.assertEqual(wakeups["android"], 622)
+
+    def test_short_uptime_is_not_inflated(self):
+        from android_battery_optimizer.diagnose import parse_alarm_stats_since_boot
+
+        sample = self.SAMPLE.replace("nowELAPSED=604800000", "nowELAPSED=7200000")
+        wakeups, _ = parse_alarm_stats_since_boot(sample)
+        self.assertEqual(wakeups["com.chatty"], 7000)
+
+
+class LastUsedParsingTests(unittest.TestCase):
+    def test_android_date_format_and_latest_interval_win(self):
+        from datetime import datetime
+        from unittest.mock import MagicMock
+
+        from android_battery_optimizer.diagnose import Diagnoser
+
+        diag = Diagnoser(MagicMock())
+        out = (
+            '  package=com.a totalTimeUsed="1:00" lastTimeUsed="2026-11-20 08:00:00"\n'
+            '  package=com.a totalTimeUsed="9:00" lastTimeUsed="2026-11-23 10:52:57"\n'
+            '  package=com.a totalTimeUsed="9:00" lastTimeUsed="1970-01-01 01:00:00"\n'
+        )
+        res = diag._parse_last_used("com.a", out)
+        self.assertTrue(res["parsed"])
+        expected = datetime(2026, 11, 23, 10, 52, 57).timestamp() * 1000
+        self.assertEqual(res["epoch_ms"], int(expected))

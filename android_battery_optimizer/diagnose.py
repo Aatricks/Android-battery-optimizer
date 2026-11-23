@@ -1,6 +1,7 @@
 import csv
 import re
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from .adb import AdbClient
 from .snapshot import parse_usagestats
@@ -112,6 +113,47 @@ def parse_alarm_wakeups(output: str) -> Dict[str, int]:
             package = match.group(2).strip()
             pkg_wakeups[package] = pkg_wakeups.get(package, 0) + wakeups
     return pkg_wakeups
+
+
+DAY_MS = 24 * 60 * 60 * 1000
+
+
+def parse_alarm_stats_since_boot(output: str) -> Tuple[Dict[str, int], Optional[int]]:
+    """Per-package wakeups from `dumpsys alarm` scaled to a 24 h rate.
+
+    Battery stats reset at every charge, so a phone charged often never builds
+    a usable window. Alarm stats count since boot instead. Lines look like
+    ``  u0a475:com.instagram.android +7m13s running, 116 wakeups:``.
+    Returns ({package: wakeups per 24 h}, elapsed ms since boot).
+    """
+    elapsed_match = re.search(r"nowELAPSED=(\d+)", output)
+    if not elapsed_match:
+        return {}, None
+    elapsed_ms = int(elapsed_match.group(1))
+    section = output.split("Alarm Stats:", 1)[1] if "Alarm Stats:" in output else ""
+    pattern = re.compile(r"^  [\w-]+:([\w.]+) \+\S+ running, (\d+) wakeups:", re.M)
+    scale = DAY_MS / max(elapsed_ms, DAY_MS)  # never inflate short uptimes
+    wakeups: Dict[str, int] = {}
+    for package, count in pattern.findall(section):
+        wakeups[package] = wakeups.get(package, 0) + round(int(count) * scale)
+    return wakeups, elapsed_ms
+
+
+def _parse_last_time_used(raw: Optional[str]) -> Optional[int]:
+    """Epoch ms from usagestats ``lastTimeUsed``: a number, or the
+    ``YYYY-MM-DD HH:MM:SS`` local time that Android 10+ prints."""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        # ponytail: read in this computer's time zone; off by the zone gap
+        # if phone and computer differ (hours, irrelevant for day thresholds).
+        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+    except ValueError:
+        return None
 
 
 def parse_wakelock_ms(output: str) -> Dict[str, int]:
@@ -275,6 +317,20 @@ class Diagnoser:
         system_summary = parse_battery_summary(
             dumpsys_outputs["batterystats_charged"]
         )
+        observation_ms = system_summary["observation_ms"]
+        if observation_ms is None or observation_ms < MIN_RESTRICTION_OBSERVATION_MS:
+            boot_alarms, elapsed_ms = parse_alarm_stats_since_boot(
+                self._safe_dumpsys(["alarm"]) or ""
+            )
+            if elapsed_ms and elapsed_ms >= MIN_RESTRICTION_OBSERVATION_MS:
+                # Charged recently: judge alarms on the since-boot rate instead.
+                alarm_map = boot_alarms
+                system_summary["observation_ms"] = elapsed_ms
+                system_summary["observation_source"] = "alarm_since_boot"
+                self.warnings.append(
+                    "Battery stats cover under 1 hour (recent charge); alarm "
+                    "wakeups are per 24 h since boot. Wakelock data is limited."
+                )
 
         results = []
         for pkg in packages:
@@ -419,14 +475,15 @@ class Diagnoser:
                                 raw_val = p.split("=")[1].strip('"')
                                 break
 
-                    if raw_val is not None:
-                        last_used["raw"] = raw_val
-                        try:
-                            last_used["epoch_ms"] = int(raw_val)
-                            last_used["parsed"] = True
-                        except ValueError:
-                            pass
-                    break
+                    epoch_ms = _parse_last_time_used(raw_val)
+                    if epoch_ms is None:
+                        if last_used["raw"] is None:
+                            last_used["raw"] = raw_val
+                        continue
+                    # usagestats repeats a package per interval (daily, weekly,
+                    # monthly, yearly); keep the most recent use.
+                    if not last_used["parsed"] or epoch_ms > last_used["epoch_ms"]:
+                        last_used.update(raw=raw_val, epoch_ms=epoch_ms, parsed=True)
         return last_used
 
     def _recommend(

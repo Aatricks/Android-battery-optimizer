@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .adb import AdbClient, CommandError
 from .android import parse_battery_dumpsys, parse_builtin_refresh_rates
+from .operations import normalize_restorable_bucket
 from .recorder import StateRecorder
 from .state import StateStore
 from .verification import VerificationError
@@ -75,6 +76,78 @@ SAMSUNG_FEATURES: Dict[str, Tuple[str, bool, List[Tuple[str, str, str]]]] = {
     ),
 }
 
+DOZE_TUNING = {
+    # light doze: slightly faster than stock, no rapid cycling
+    "light_after_inactive_to": "60000",  # 1 min
+    "light_idle_to": "300000",  # 5 min
+    "light_idle_factor": "2",
+    "light_max_idle_to": "900000",  # 15 min (stock); 30 min delayed notifications
+    # deep doze: enter fast, stay long
+    "inactive_to": "300000",  # 5 min (stock 30 min)
+    "idle_after_inactive_to": "0",
+    "sensing_to": "0",
+    "locating_to": "0",
+    "motion_inactive_to": "0",
+    "idle_pending_to": "60000",  # 1 min maintenance
+    "max_idle_pending_to": "120000",
+    "idle_pending_factor": "2",
+    "idle_to": "3600000",  # 1 h first deep idle
+    "idle_factor": "2",
+    "max_idle_to": "21600000",  # 6 h max
+}
+
+# Background radios and caches only: nothing the user sees or chose.
+BACKGROUND_SETTINGS = [
+    ("global", "ble_scan_always_enabled", "0"),
+    ("global", "wifi_scan_throttle_enabled", "1"),
+    ("global", "mobile_data_always_on", "0"),
+    ("global", "cached_apps_freezer", "enabled"),
+    ("global", "adaptive_battery_management_enabled", "1"),
+    ("global", "wifi_scan_always_enabled", "0"),
+]
+
+
+def battery_saver_constants(vibration_disabled: bool) -> str:
+    return (
+        "advertise_is_enabled=true,"
+        "datasaver_disabled=false,"
+        "enable_night_mode=true,"
+        "launch_boost_disabled=true,"
+        f"vibration_disabled={'true' if vibration_disabled else 'false'},"
+        "animation_disabled=true,"
+        "soundtrigger_disabled=true,"
+        "fullbackup_deferred=true,"
+        "keyvaluebackup_deferred=true,"
+        # Keep network for non-allowlisted apps in Battery Saver:
+        # the firewall stops Gmail & co fetching after a push.
+        "firewall_disabled=true,"
+        "gps_mode=2,"
+        "adjust_brightness_disabled=false,"
+        "adjust_brightness_factor=0.5,"
+        "force_all_apps_standby=true,"
+        "force_background_check=true,"
+        "optional_sensors_disabled=true,"
+        "aod_disabled=false,"
+        "quick_doze_enabled=true"
+    )
+
+
+# Hidden tuning keys this tool writes. Deleting them makes Android fall back
+# to its built-in defaults. User-facing choices (dark mode, screen timeout,
+# AOD, Samsung motion features) are left alone on purpose.
+STOCK_DEFAULT_SETTINGS = [
+    ("global", "device_idle_constants"),
+    ("global", "battery_saver_constants"),
+    ("global", "window_animation_scale"),
+    ("global", "transition_animation_scale"),
+    ("global", "animator_duration_scale"),
+    ("global", "cached_apps_freezer"),
+    ("global", "mobile_data_always_on"),
+]
+RESTRICTED_APPOP_MODES = {"ignore", "deny"}
+RESTRICTED_BUCKETS = {"rare", "restricted"}
+
+
 class BatteryOptimizerApp:
     def __init__(self, client: AdbClient, state_dir: Path) -> None:
         self.client = client
@@ -89,9 +162,7 @@ class BatteryOptimizerApp:
 
     @property
     def whitelist_path(self) -> Path:
-        serial = self.client.serial or "unknown-device"
-        safe_serial = StateStore.sanitize_serial(serial)
-        return self.state_dir / "devices" / safe_serial / WHITELIST_FILE
+        return StateStore.device_dir(self.state_dir, self.client.serial) / WHITELIST_FILE
 
     @property
     def legacy_whitelist_path(self) -> Path:
@@ -217,27 +288,28 @@ class BatteryOptimizerApp:
             1,
         )
 
-    def apply_experimental_optimizations(self) -> None:
+    def _check_tuning_support(self, label: str) -> bool:
+        """Shared preflight; returns whether device_config is writable."""
         info = self.client.get_device_info_struct()
         # SDK 26 (Android 8.0) is a conservative minimum for device_config
         # and stable settings behavior
         if info.sdk_int < 26:
             raise ValueError(
-                f"Device SDK {info.sdk_int} is too old for experimental "
+                f"Device SDK {info.sdk_int} is too old for {label} "
                 "optimizations (min SDK 26 required)."
             )
 
         if not self.client.supports_device_config():
             raise ValueError(
                 "Device does not support `device_config` command. "
-                "Experimental optimization aborted."
+                f"{label.capitalize()} optimization aborted."
             )
 
         for namespace in ("global", "system", "secure"):
             if not self.client.supports_settings_namespace(namespace):
                 raise ValueError(
                     f"Device does not support `settings` namespace "
-                    f"`{namespace}`. Experimental optimization aborted."
+                    f"`{namespace}`. {label.capitalize()} optimization aborted."
                 )
 
         device_config_writable = self.client.supports_device_config_write(
@@ -249,52 +321,54 @@ class BatteryOptimizerApp:
                 "applying Doze tuning via the legacy device_idle_constants "
                 "setting and skipping abusive-app flags."
             )
+        return device_config_writable
+
+    def _apply_doze_tuning(self, device_config_writable: bool) -> None:
+        if device_config_writable:
+            for key, value in DOZE_TUNING.items():
+                self.recorder.put_device_config("device_idle", key, value)
+        else:
+            # Android 14+ allowlist blocks shell device_config writes, but
+            # DeviceIdleController still honors the pre-Android-10 global
+            # setting (verified live on Samsung SM-S901B / Android 16).
+            legacy_constants = ",".join(
+                f"{key}={value}" for key, value in DOZE_TUNING.items()
+            )
+            self.recorder.put_setting(
+                "global", "device_idle_constants", legacy_constants
+            )
+
+    def apply_daily_optimizations(self) -> None:
+        """Background-only savings that keep notifications and user choices.
+
+        Doze tuning, background scans off, Battery Saver that keeps network and
+        vibration. Leaves screen timeout, dark mode, AOD, animations, refresh
+        rate and Data Saver alone.
+        """
+        device_config_writable = self._check_tuning_support("daily")
+        with self.recorder.transaction():
+            self._apply_doze_tuning(device_config_writable)
+            for namespace, key, value in BACKGROUND_SETTINGS:
+                self.recorder.put_setting(namespace, key, value)
+            self.recorder.put_setting(
+                "global",
+                "battery_saver_constants",
+                battery_saver_constants(vibration_disabled=False),
+            )
+            if device_config_writable:
+                self._apply_safe_flags()
+
+    def apply_experimental_optimizations(self) -> None:
+        device_config_writable = self._check_tuning_support("experimental")
 
         with self.recorder.transaction():
-            doze_settings = {
-                # light doze: slightly faster than stock, no rapid cycling
-                "light_after_inactive_to": "60000",  # 1 min
-                "light_idle_to": "300000",  # 5 min
-                "light_idle_factor": "2",
-                "light_max_idle_to": "1800000",  # 30 min
-                # deep doze: enter fast, stay long
-                "inactive_to": "300000",  # 5 min (stock 30 min)
-                "idle_after_inactive_to": "0",
-                "sensing_to": "0",
-                "locating_to": "0",
-                "motion_inactive_to": "0",
-                "idle_pending_to": "60000",  # 1 min maintenance
-                "max_idle_pending_to": "120000",
-                "idle_pending_factor": "2",
-                "idle_to": "3600000",  # 1 h first deep idle
-                "idle_factor": "2",
-                "max_idle_to": "21600000",  # 6 h max
-            }
-            if device_config_writable:
-                for key, value in doze_settings.items():
-                    self.recorder.put_device_config("device_idle", key, value)
-            else:
-                # Android 14+ allowlist blocks shell device_config writes, but
-                # DeviceIdleController still honors the pre-Android-10 global
-                # setting (verified live on Samsung SM-S901B / Android 16).
-                legacy_constants = ",".join(
-                    f"{key}={value}" for key, value in doze_settings.items()
-                )
-                self.recorder.put_setting(
-                    "global", "device_idle_constants", legacy_constants
-                )
+            self._apply_doze_tuning(device_config_writable)
 
-            settings_to_apply = [
+            settings_to_apply = BACKGROUND_SETTINGS + [
                 ("global", "window_animation_scale", "0.5"),
                 ("global", "transition_animation_scale", "0.5"),
                 ("global", "animator_duration_scale", "0.5"),
-                ("global", "ble_scan_always_enabled", "0"),
                 ("system", "nearby_scanning_enabled", "0"),
-                ("global", "wifi_scan_throttle_enabled", "1"),
-                ("global", "mobile_data_always_on", "0"),
-                ("global", "cached_apps_freezer", "enabled"),
-                ("global", "adaptive_battery_management_enabled", "1"),
-                ("global", "wifi_scan_always_enabled", "0"),
                 ("secure", "doze_always_on", "0"),
                 ("secure", "ui_night_mode", "2"),
                 ("system", "screen_off_timeout", "30000"),
@@ -302,27 +376,11 @@ class BatteryOptimizerApp:
             for namespace, key, value in settings_to_apply:
                 self.recorder.put_setting(namespace, key, value)
 
-            constants = (
-                "advertise_is_enabled=true,"
-                "datasaver_disabled=false,"
-                "enable_night_mode=true,"
-                "launch_boost_disabled=true,"
-                "vibration_disabled=true,"
-                "animation_disabled=true,"
-                "soundtrigger_disabled=true,"
-                "fullbackup_deferred=true,"
-                "keyvaluebackup_deferred=true,"
-                "firewall_disabled=false,"
-                "gps_mode=2,"
-                "adjust_brightness_disabled=false,"
-                "adjust_brightness_factor=0.5,"
-                "force_all_apps_standby=true,"
-                "force_background_check=true,"
-                "optional_sensors_disabled=true,"
-                "aod_disabled=false,"
-                "quick_doze_enabled=true"
+            self.recorder.put_setting(
+                "global",
+                "battery_saver_constants",
+                battery_saver_constants(vibration_disabled=True),
             )
-            self.recorder.put_setting("global", "battery_saver_constants", constants)
             if device_config_writable:
                 self._apply_safe_flags()
 
@@ -424,8 +482,10 @@ class BatteryOptimizerApp:
         from .snapshot import SnapshotError
 
         whitelist = set(self.load_whitelist())
+        protected = self._get_protected_packages()
         packages = self.get_packages(third_party=True)
         skipped_whitelisted = []
+        skipped_protected = []
         skipped_non_restorable = []
 
         with self.recorder.transaction():
@@ -433,6 +493,11 @@ class BatteryOptimizerApp:
             for package in packages:
                 if package in whitelist:
                     skipped_whitelisted.append(package)
+                    continue
+                if level != "allow" and package in protected:
+                    # SMS, dialer, mail, keyboard, launcher, watch...: restricting
+                    # them delays or drops notifications.
+                    skipped_protected.append(f"{package} ({protected[package]})")
                     continue
                 try:
                     prior_bucket = self.recorder._get_standby_bucket(package)
@@ -445,16 +510,23 @@ class BatteryOptimizerApp:
                 self.recorder.set_standby_bucket(package, bucket)
         return {
             "skipped_whitelisted": skipped_whitelisted,
+            "skipped_protected": skipped_protected,
             "skipped_non_restorable": skipped_non_restorable
         }
 
     def preview_restrict_background_apps(self, level: str = "ignore") -> Dict[str, Any]:
         whitelist = set(self.load_whitelist())
+        protected = self._get_protected_packages() if level != "allow" else {}
         packages = self.get_packages(third_party=True)
         return {
             "level": level,
-            "would_change": [p for p in packages if p not in whitelist],
+            "would_change": [
+                p for p in packages if p not in whitelist and p not in protected
+            ],
             "kept_whitelisted": [p for p in packages if p in whitelist],
+            "kept_protected": [
+                p for p in packages if p not in whitelist and p in protected
+            ],
         }
 
     def run_bg_dexopt(self) -> None:
@@ -463,6 +535,67 @@ class BatteryOptimizerApp:
             mutate=True,
             timeout=self.client.LONG_TIMEOUT_SECONDS,
         )
+
+    def reset_to_defaults(self) -> List[str]:
+        """Put tuning back to stock Android defaults, regardless of saved state.
+
+        Goes through the recorder, so every change is snapshotted and `revert`
+        can undo the reset.
+        """
+        from .snapshot import SnapshotError
+        from .verification import parse_netpolicy_toggle
+
+        changed: List[str] = []
+        bucket_resets: List[Tuple[str, str]] = []  # (package, raw prior bucket)
+        with self.recorder.transaction():
+            self.recorder.prefetch_package_states()
+            for namespace, key in STOCK_DEFAULT_SETTINGS:
+                current = self.recorder._normalize_value(
+                    self.recorder._get_setting(namespace, key)
+                )
+                if current is not None:
+                    self.recorder.delete_setting(namespace, key)
+                    changed.append(f"{namespace}/{key}: {current} -> default")
+
+            for package in self.get_packages(third_party=False):
+                try:
+                    mode = self.recorder._get_appop(package, "RUN_ANY_IN_BACKGROUND")
+                    if mode in RESTRICTED_APPOP_MODES:
+                        self.recorder.set_appop(package, "RUN_ANY_IN_BACKGROUND", "default")
+                        changed.append(f"{package}: background {mode} -> default")
+                    raw_bucket = self.recorder._get_standby_bucket(package)
+                    bucket = normalize_restorable_bucket(raw_bucket)
+                    if bucket in RESTRICTED_BUCKETS:
+                        bucket_resets.append((package, raw_bucket))
+                except (SnapshotError, ValueError):
+                    continue
+
+            try:
+                res = self.client.shell(["cmd", "netpolicy", "get", "restrict-background"])
+                data_saver_on = parse_netpolicy_toggle(res.stdout)
+            except Exception:
+                data_saver_on = False
+            if data_saver_on:
+                self.recorder.set_netpolicy_restrict_background(False)
+                changed.append("Data Saver: on -> off")
+
+        # One transaction per app: the OS may refuse a bucket (Samsung pins its
+        # "Deep sleeping apps" at restricted), and that must only roll back
+        # that one app. No "default" bucket exists; active decays with use.
+        for package, raw_bucket in bucket_resets:
+            bucket = normalize_restorable_bucket(raw_bucket)
+            try:
+                with self.recorder.transaction():
+                    # Transactions start with empty caches; reuse the value read above.
+                    self.recorder._standby_bucket_cache[package] = raw_bucket
+                    self.recorder.set_standby_bucket(package, "active")
+                changed.append(f"{package}: bucket {bucket} -> active")
+            except VerificationError:
+                changed.append(
+                    f"{package}: bucket {bucket} kept, the phone refused the change "
+                    "(on Samsung: remove it from Battery > Background usage limits)"
+                )
+        return changed
 
     def revert_saved_state(self) -> List[str]:
         if not self.store.has_entries():
@@ -499,6 +632,10 @@ class BatteryOptimizerApp:
             ],
             "dialer": ["telecom", "get-default-dialer"],
             "sms": ["settings", "get", "secure", "sms_default_application"],
+            # Android 10+ keeps the real holders in roles; the setting above is
+            # often null (seen on Samsung / Android 16).
+            "sms_role": ["cmd", "role", "get-role-holders", "android.app.role.SMS"],
+            "dialer_role": ["cmd", "role", "get-role-holders", "android.app.role.DIALER"],
             "ime": ["settings", "get", "secure", "default_input_method"],
             "a11y": ["settings", "get", "secure", "enabled_accessibility_services"],
             "vpn": ["settings", "get", "secure", "always_on_vpn_app"],

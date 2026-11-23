@@ -97,11 +97,13 @@ Each action is also a direct subcommand, which is easier to script:
 | `diagnose` | Run battery diagnostics (alarms, partial wakelocks, jobs) and list apps bypassing Doze |
 | `smart-restrict` | Intelligently restrict apps (appop `RUN_ANY_IN_BACKGROUND` and Standby Bucket rare/restricted). Aggressive mode prunes Doze-whitelist and disables `WAKE_LOCK` appop. Hibernates long-inactive apps (SDK >= 31) |
 | `apply-safe` | Applies documented safe optimizations |
+| `apply-daily --yes` | Recommended. Background-only savings: accelerated Doze, background Wi-Fi/BLE scans off, Battery Saver that keeps network and vibration. Leaves screen timeout, dark mode, AOD, animations, refresh rate and Data Saver alone |
 | `apply-experimental --yes` | Applies experimental optimizations (accelerated Doze constants, force dark mode, screen timeout, disabled AOD/wifi-scan, Netpolicy Data Saver/exemptions; does not write `low_power` or touch refresh-rate) |
 | `apply-samsung-experimental --yes` | Applies Samsung optimizations (AOD off; preserves GOS; never touches refresh-rate). The web GUI lets you untick individual features |
 | `apply-120hz-endurance --yes` | Applies the reversible experimental profile only when the built-in display supports 120 Hz, then verifies 120 Hz remains available |
 | `restrict-apps --level {ignore,deny,allow} --yes` | Restrict background apps |
 | `revert` | Restores saved state for the selected device |
+| `reset-defaults --yes` | Resets tuning keys, background restrictions and Data Saver to stock Android defaults (snapshotted, so `revert` undoes it) |
 | `doctor-state` | Check saved state for non-restorable standby bucket entries |
 | `whitelist list` | List whitelisted apps |
 | `whitelist add <package>` | Add app to whitelist |

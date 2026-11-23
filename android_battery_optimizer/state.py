@@ -16,6 +16,24 @@ class StateStore:
         # Keep only A-Z, a-z, 0-9, dot, underscore, hyphen. Replace others with "_"
         return re.sub(r"[^A-Za-z0-9._-]", "_", serial)
 
+    @classmethod
+    def device_dir(cls, base_state_dir: Path, serial: Optional[str]) -> Path:
+        """Per-device state folder, keyed by the hardware serial.
+
+        Wireless ADB names a device ``adb-<serial>-<id>[ (n)]._adb-tls-connect._tcp``
+        and the suffix changes between pairings, so the same phone used to get a
+        fresh (already-optimized) "original" snapshot per transport. Folders
+        written under the old transport name are still used if present.
+        """
+        serial = serial or "unknown-device"
+        devices = base_state_dir / "devices"
+        match = re.match(r"adb-([A-Za-z0-9]+)-.*\._adb-tls-connect\._tcp$", serial)
+        canonical = devices / cls.sanitize_serial(match.group(1) if match else serial)
+        legacy = devices / cls.sanitize_serial(serial)
+        if not canonical.exists() and legacy.exists():
+            return legacy
+        return canonical
+
     def __init__(self, base_state_dir: Path, client: AdbClient) -> None:
         self.base_state_dir = base_state_dir
         self.client = client
@@ -39,10 +57,7 @@ class StateStore:
         }
 
     def rebind(self) -> None:
-        serial = self.client.serial or "unknown-device"
-        safe_serial = self.sanitize_serial(serial)
-        device_dir = self.base_state_dir / "devices" / safe_serial
-        self.path = device_dir / SNAPSHOT_FILE
+        self.path = self.device_dir(self.base_state_dir, self.client.serial) / SNAPSHOT_FILE
         self.data = self._load()
 
     def _quarantine_state_file(self) -> None:

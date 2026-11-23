@@ -784,6 +784,11 @@
                         <button class="btn btn-primary" onclick="applySafe()">Apply</button>
                     </div>
                     <div class="action-row">
+                        <div class="action-row-title">Daily Profile <span class="chip chip-review">recommended</span></div>
+                        <div class="action-row-desc">Deeper Doze, background scans off, Battery Saver that keeps network and vibration. Leaves notifications, screen timeout, dark mode, AOD and 120 Hz alone.</div>
+                        <button class="btn btn-primary" onclick="applyDaily()">Apply</button>
+                    </div>
+                    <div class="action-row">
                         <div class="action-row-title">Experimental Profile <span class="chip chip-review">experimental</span></div>
                         <div class="action-row-desc">Tunes Doze timers so the phone idles sooner and sleeps deeper. Changes system settings.</div>
                         <button class="btn btn-secondary" onclick="applyExperimental()">Apply</button>
@@ -817,6 +822,7 @@
                 <div class="status-line" id="opt-status"></div>
                 <div class="card-divider">
                     <button class="btn btn-danger" id="revert-btn" onclick="applyRevert()">Revert Saved State</button>
+                    <button class="btn btn-danger" id="reset-defaults-btn" onclick="applyResetDefaults()">Reset to Android Defaults</button>
                 </div>
             </div>
 
@@ -1196,6 +1202,18 @@
             refreshStatus();
         }
 
+        async function applyDaily() {
+            const ok = await confirmModal(
+                "Apply Daily Optimizations",
+                "Tunes Doze and turns off background Wi-Fi/Bluetooth scanning. Urgent pushes still arrive; non-urgent ones may wait a few minutes while the phone sleeps. Continue?"
+            );
+            if (ok) {
+                const data = await apiCall('POST', '/api/apply/daily', { confirm: true });
+                if (data) showStatus('opt-status', 'Daily profile applied. Rollback saved.');
+                refreshStatus();
+            }
+        }
+
         async function applyExperimental() {
             const ok = await confirmModal(
                 "Apply Experimental Optimizations",
@@ -1247,17 +1265,19 @@
             if (!preview) return;
             const affected = preview.result.would_change.length;
             const kept = preview.result.kept_whitelisted.length;
+            const keptProt = (preview.result.kept_protected || []).length;
             const verb = lvl === 'allow' ? 'allow background use for' : 'restrict background use for';
             const ok = await confirmModal(
                 "Apply App Restrictions",
-                `This will ${verb} ${affected} third-party apps. ${kept} whitelisted apps are kept, and apps in non-restorable standby buckets are skipped automatically. This may affect notifications, sync, or device stability. Continue?`
+                `This will ${verb} ${affected} third-party apps. ${kept} whitelisted and ${keptProt} protected apps (SMS, mail, keyboard, launcher, watch...) are kept, and apps in non-restorable standby buckets are skipped automatically. This may affect notifications, sync, or device stability. Continue?`
             );
             if (ok) {
                 const data = await apiCall('POST', '/api/restrict-apps', { level: lvl, confirm: true });
                 if (data) {
                     const skippedNr = (data.result.skipped_non_restorable || []).length;
                     const keptWl = (data.result.skipped_whitelisted || []).length;
-                    showStatus('opt-status', `Restriction applied to ${affected - skippedNr} apps. ${keptWl} whitelisted kept, ${skippedNr} skipped (non-restorable). Rollback saved.`);
+                    const keptPr = (data.result.skipped_protected || []).length;
+                    showStatus('opt-status', `Restriction applied to ${affected - skippedNr} apps. ${keptWl} whitelisted kept, ${keptPr} protected kept, ${skippedNr} skipped (non-restorable). Rollback saved.`);
                 }
                 refreshStatus();
             }
@@ -1271,6 +1291,19 @@
                     const restored = data.result.restored;
                     appendLogs(restored.length ? restored : ['No saved state found to restore.']);
                     showStatus('opt-status', restored.length ? `Reverted ${restored.length} saved item(s).` : 'No saved state found to restore.');
+                }
+                refreshStatus();
+            }
+        }
+
+        async function applyResetDefaults() {
+            const ok = await confirmModal("Reset to Android Defaults", "Remove all tuning and background restrictions so Android uses its own defaults? You can undo this with Revert. Continue?");
+            if (ok) {
+                const data = await apiCall('POST', '/api/reset-defaults', {confirm: true});
+                if (data && data.result && data.result.changed) {
+                    const changed = data.result.changed;
+                    appendLogs(changed.length ? changed : ['Already at defaults.']);
+                    showStatus('opt-status', changed.length ? `Reset ${changed.length} item(s) to defaults.` : 'Already at defaults.');
                 }
                 refreshStatus();
             }

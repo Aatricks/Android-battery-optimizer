@@ -124,3 +124,26 @@ class StateStoreLoadHardeningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceDirTests(unittest.TestCase):
+    def test_usb_and_wireless_serials_share_one_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            usb = StateStore.device_dir(base, "RFCT8025BKP")
+            for wireless in (
+                "adb-RFCT8025BKP-6rXWfv._adb-tls-connect._tcp",
+                "adb-RFCT8025BKP-6rXWfv (2)._adb-tls-connect._tcp",
+            ):
+                self.assertEqual(StateStore.device_dir(base, wireless), usb)
+            self.assertEqual(
+                StateStore.device_dir(base, "192.168.1.5:5555").name, "192.168.1.5_5555"
+            )
+
+    def test_legacy_transport_folder_still_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            serial = "adb-ABC123-xyz (2)._adb-tls-connect._tcp"
+            legacy = base / "devices" / StateStore.sanitize_serial(serial)
+            legacy.mkdir(parents=True)
+            self.assertEqual(StateStore.device_dir(base, serial), legacy)

@@ -4,6 +4,7 @@ from typing import List, Optional, cast
 from .adb import AdbClient, CommandError
 from .ledger import AnyLedgerEntry
 from .operations import STANDBY_BUCKET_MAP
+from .snapshot import parse_usagestats
 
 PACKAGE_USER_ID = "0"
 
@@ -67,6 +68,26 @@ def compare_standby_bucket_value(actual_stdout: str, expected_bucket: str) -> bo
         expected_bucket.lower(), expected_bucket
     )
     return actual == expected_code
+
+
+EXEMPTED_BUCKET = "5"
+
+
+def resolve_standby_bucket(
+    client: AdbClient, package: str, reported: str, usagestats: Optional[str] = None
+) -> str:
+    """Return the real bucket when `am get-standby-bucket` answers EXEMPTED.
+
+    While the phone charges, app standby is paused and `am get-standby-bucket`
+    reports 5 (EXEMPTED) for every app. `dumpsys usagestats` still has the
+    real bucket. Truly exempt apps read 5 there too.
+    """
+    reported = reported.strip()
+    if reported != EXEMPTED_BUCKET:
+        return reported
+    if usagestats is None:
+        usagestats = client.shell(["dumpsys", "usagestats"], check=False).stdout
+    return parse_usagestats(usagestats).get(package, reported)
 
 
 def compare_package_enabled_value(
@@ -178,8 +199,8 @@ def verify_standby_bucket(client: AdbClient, package: str, expected_bucket: str)
             f"Verification failed for standby bucket for package {package}: "
             f"read command failed with exit code {result.returncode}"
         )
-    if not compare_standby_bucket_value(result.stdout, expected_bucket):
-        actual = result.stdout.strip()
+    actual = resolve_standby_bucket(client, package, result.stdout)
+    if not compare_standby_bucket_value(actual, expected_bucket):
         expected_code = STANDBY_BUCKET_MAP.get(expected_bucket.lower(), expected_bucket)
         raise VerificationError(
             f"Verification failed for standby bucket for package {package}: "
@@ -415,10 +436,15 @@ def verify_entries_batched(client: AdbClient, entries: List[AnyLedgerEntry]) -> 
             except ValueError:
                 continue
 
+    usagestats: Optional[str] = None
     for i, entry in enumerate(entries):
         content = sections.get(i, "")
         type_ = entry["type"]
         new_val = entry.get("new_value")
+        if type_ == "standby_bucket" and content.strip() == EXEMPTED_BUCKET:
+            if usagestats is None:
+                usagestats = client.shell(["dumpsys", "usagestats"], check=False).stdout
+            content = resolve_standby_bucket(client, entry["package"], content, usagestats)
 
         success = False
         try:

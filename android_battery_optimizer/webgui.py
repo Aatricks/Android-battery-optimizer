@@ -31,6 +31,7 @@ class WebApi:
             "/api/smart-restrict/preview": ("POST", self.handle_smart_restrict_preview),
             "/api/smart-restrict/apply": ("POST", self.handle_smart_restrict_apply),
             "/api/apply/safe": ("POST", self.handle_apply_safe),
+            "/api/apply/daily": ("POST", self.handle_apply_daily),
             "/api/apply/experimental": ("POST", self.handle_apply_experimental),
             "/api/apply/samsung-experimental": ("POST", self.handle_apply_samsung_experimental),
             "/api/samsung-features": ("GET", self.handle_samsung_features),
@@ -38,6 +39,7 @@ class WebApi:
             "/api/restrict-apps/preview": ("POST", self.handle_restrict_apps_preview),
             "/api/restrict-apps": ("POST", self.handle_restrict_apps),
             "/api/revert": ("POST", self.handle_revert),
+            "/api/reset-defaults": ("POST", self.handle_reset_defaults),
             "/api/whitelist": (("GET", "POST"), self.handle_whitelist),
             "/api/packages": ("GET", self.handle_packages),
             "/api/doctor-state": ("GET", self.handle_doctor_state),
@@ -128,6 +130,12 @@ class WebApi:
         self.app.apply_documented_safe_optimizations()
         return 200, {"ok": True}
 
+    def handle_apply_daily(self, method, path, query, payload):
+        if not payload.get("confirm"):
+            return 400, {"error": "Confirmation required."}
+        self.app.apply_daily_optimizations()
+        return 200, {"ok": True}
+
     def handle_apply_experimental(self, method, path, query, payload):
         if not payload.get("confirm"):
             return 400, {"error": "Confirmation required."}
@@ -176,6 +184,11 @@ class WebApi:
     def handle_revert(self, method, path, query, payload):
         res = self.app.revert_saved_state()
         return 200, {"restored": res}
+
+    def handle_reset_defaults(self, method, path, query, payload):
+        if not payload.get("confirm"):
+            return 400, {"error": "Confirmation required."}
+        return 200, {"changed": self.app.reset_to_defaults()}
 
     def handle_whitelist(self, method, path, query, payload):
         if method == "POST":

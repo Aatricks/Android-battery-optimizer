@@ -244,7 +244,8 @@ class TestNewRequirements(unittest.TestCase):
     def test_item7_standby_bucket_fallback(self):
         self.app.recorder._prefetch_standby_bucket_success = True
         self.app.recorder._standby_bucket_cache = {}
-        
+        # Not listed in usagestats: a truly EXEMPTED app keeps "5".
+        self.runner.responses["adb -s test_device shell dumpsys usagestats"] = CommandResult(0, "", "")
         self.runner.responses["adb -s test_device shell am get-standby-bucket com.example.app"] = CommandResult(0, "5\n", "")
         
         val = self.app.recorder._get_standby_bucket("com.example.app")
@@ -434,7 +435,29 @@ class TestNewRequirements(unittest.TestCase):
         saver_cmds = [c for c in self.runner.commands if "battery_saver_constants" in c]
         self.assertTrue(any("adjust_brightness_factor=0.5" in cmd for cmd in saver_cmds))
         self.assertTrue(any("gps_mode=2" in cmd for cmd in saver_cmds))
-        self.assertTrue(any("firewall_disabled=false" in cmd for cmd in saver_cmds))
+        self.assertTrue(any("firewall_disabled=true" in cmd for cmd in saver_cmds))
+
+    def test_daily_profile_only_touches_background_settings(self):
+        self.runner.commands.clear()
+        self.runner.responses["adb -s test_device shell getprop ro.product.brand; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.build.fingerprint"] = CommandResult(
+            0, "Google\nPixel\n11\n30\nfingerprint\n", ""
+        )
+
+        self.app.apply_daily_optimizations()
+        cmds = " ".join(self.runner.commands)
+
+        self.assertIn("device_idle inactive_to 300000", cmds)
+        self.assertIn("ble_scan_always_enabled 0", cmds)
+        self.assertIn("wifi_scan_always_enabled 0", cmds)
+        self.assertIn("vibration_disabled=false", cmds)
+        self.assertIn("firewall_disabled=true", cmds)
+        # User-visible choices, notifications and the refresh rate stay alone.
+        for key in (
+            "screen_off_timeout", "ui_night_mode", "doze_always_on", "aod_mode",
+            "animation_scale", "animator_duration_scale", "refresh_rate",
+            "restrict-background", "nearby_scanning_enabled", "vibration_on",
+        ):
+            self.assertNotIn(key, cmds)
 
     def test_netpolicy_skip_on_unparseable(self):
         self.runner.commands.clear()

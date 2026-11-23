@@ -41,6 +41,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add_subparser("status", help="Checks ADB environment and device info")
     add_subparser("apply-safe", help="Applies documented safe optimizations")
 
+    parser_daily = add_subparser(
+        "apply-daily",
+        help="Background-only savings; keeps notifications, 120 Hz and your settings",
+    )
+    parser_daily.add_argument("--yes", action="store_true", help="Confirm daily optimizations")
+
     parser_exp = add_subparser("apply-experimental", help="Applies experimental optimizations")
     parser_exp.add_argument("--yes", action="store_true", help="Confirm experimental optimizations")
 
@@ -77,6 +83,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser_smart_restrict.add_argument("--min-last-used-days", type=int, help="Skip restriction for apps used within this many days")
 
     add_subparser("revert", help="Reverts saved state for selected serial")
+    parser_reset = add_subparser(
+        "reset-defaults",
+        help="Reset tuning to stock Android defaults (undo with revert)",
+    )
+    parser_reset.add_argument("--yes", action="store_true", help="Confirm reset")
 
     parser_wl = add_subparser("whitelist", help="Manage whitelist")
     wl_sub = parser_wl.add_subparsers(dest="wl_command")
@@ -354,6 +365,15 @@ class BatteryOptimizerCLI:
                 self.output("Applied abusive-app auto restriction tracking from AOSP documentation.")
                 return 0
 
+            elif args.command == "apply-daily":
+                if not args.yes:
+                    self.output("Error: --yes is required for daily optimizations.")
+                    return 1
+                self.output("Applying daily optimizations...")
+                self.app.apply_daily_optimizations()
+                self.output("Daily optimizations applied. Use `revert` to undo.")
+                return 0
+
             elif args.command == "apply-experimental":
                 if not args.yes:
                     self.output("Error: --yes is required for experimental optimizations in non-interactive mode.")
@@ -392,6 +412,8 @@ class BatteryOptimizerCLI:
                 res = self.app.restrict_background_apps(level=args.level)
                 for pkg in res["skipped_whitelisted"]:
                     self.output(f"  Skipping whitelisted app: {pkg}")
+                for pkg in res.get("skipped_protected", []):
+                    self.output(f"  Skipping protected app: {pkg}")
                 for pkg in res["skipped_non_restorable"]:
                     self.output(f"  Skipping app with non-restorable standby bucket: {pkg}")
                 self.output("Background restrictions updated.")
@@ -558,6 +580,20 @@ class BatteryOptimizerCLI:
                     self.output("Restore finished.")
                 return 0
 
+            elif args.command == "reset-defaults":
+                if not args.yes:
+                    self.output("Error: --yes is required to reset to defaults.")
+                    return 1
+                self.output("Resetting to stock Android defaults...")
+                changes = self.app.reset_to_defaults()
+                for change in changes:
+                    self.output(f"  {change}")
+                if changes:
+                    self.output("Reset finished. Use `revert` to undo.")
+                else:
+                    self.output("Already at defaults.")
+                return 0
+
             elif args.command == "doctor-state":
                 self.output("Checking saved state for non-restorable standby bucket entries...")
                 count = 0
@@ -670,6 +706,8 @@ class BatteryOptimizerCLI:
                     res = self.app.restrict_background_apps(level="ignore")
                     for pkg in res["skipped_whitelisted"]:
                         self.output(f"  Skipping whitelisted app: {pkg}")
+                    for pkg in res.get("skipped_protected", []):
+                        self.output(f"  Skipping protected app: {pkg}")
                     for pkg in res["skipped_non_restorable"]:
                         self.output(f"  Skipping app with non-restorable standby bucket: {pkg}")
                     self.output("Background restrictions updated.")

@@ -20,6 +20,7 @@ from .verification import (
     parse_hibernation_state,
     parse_netpolicy_toggle,
     parse_netpolicy_whitelist,
+    resolve_standby_bucket,
     verify_app_hibernation,
     verify_appop,
     verify_device_config,
@@ -465,6 +466,7 @@ class StateRecorder:
                 f"invalid output '{val}'"
             )
 
+        val = resolve_standby_bucket(self.client, package, val)
         self._standby_bucket_cache[package] = val
         return val
 
